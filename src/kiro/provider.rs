@@ -126,7 +126,7 @@ impl KiroProvider {
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
-    /// - 429/5xx/网络等瞬态错误: 重试但不禁用凭据（避免误把所有凭据锁死）
+    /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
     ///
     /// # Arguments
     /// * `request_body` - JSON 格式的请求体字符串
@@ -142,7 +142,7 @@ impl KiroProvider {
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
-    /// - 429/5xx/网络等瞬态错误: 重试但不禁用凭据（避免误把所有凭据锁死）
+    /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
     ///
     /// # Arguments
     /// * `request_body` - JSON 格式的请求体字符串
@@ -205,9 +205,8 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致“禁用凭据”
+                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    let _ = self.token_manager.switch_to_next();
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -256,7 +255,8 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用凭据（避免 502 把所有凭据锁死）
+            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
+            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
@@ -265,8 +265,6 @@ impl KiroProvider {
                     status,
                     body
                 );
-                // 尝试切换到其他凭据（不计入失败次数）
-                let _ = self.token_manager.switch_to_next();
                 last_error = Some(anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
@@ -279,7 +277,7 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
-            // 兜底：当作可重试的瞬态错误处理
+            // 兜底：当作可重试的瞬态错误处理（不切换凭据）
             tracing::warn!(
                 "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
                 attempt + 1,
@@ -287,7 +285,6 @@ impl KiroProvider {
                 status,
                 body
             );
-            let _ = self.token_manager.switch_to_next();
             last_error = Some(anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
