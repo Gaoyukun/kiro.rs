@@ -889,35 +889,18 @@ impl StreamContext {
     }
 
     /// 创建截断工具的错误事件（替换原有工具调用）
-    fn create_truncated_tool_error_events(
-        &mut self,
-        block_index: i32,
-        tool_name: &str,
-    ) -> Vec<SseEvent> {
+    fn create_truncated_tool_error_events(&mut self, tool_name: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
-
-        let block_state = self
-            .state_manager
-            .active_blocks
-            .get(&block_index)
-            .map(|b| (b.block_type.clone(), b.started, b.stopped));
 
         tracing::warn!(
             message_id = %self.message_id,
-            block_index,
             tool_name,
-            block_state = ?block_state,
             "create_truncated_tool_error_events 被调用"
         );
 
         // 关键：不要再发送任何 input_json_delta（否则客户端会把它当作工具调用去执行）。
         // 这里将 tool_use 块收尾，然后输出一个普通 text 块作为“系统提示”，并以 end_turn 结束消息。
         self.state_manager.set_stop_reason("end_turn");
-
-        // 关闭工具块
-        if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
-            events.push(stop_event);
-        }
 
         // 创建新的 text 块并立即关闭，避免残留未关闭的块状态影响 message_delta
         let text_index = self.state_manager.next_block_index();
@@ -955,6 +938,32 @@ impl StreamContext {
         if let Some(stop_event) = self.state_manager.handle_content_block_stop(text_index) {
             events.push(stop_event);
         }
+
+        events
+    }
+
+    /// 关闭所有打开的 text 块（用于延迟发送 Write 工具调用时保持块顺序一致）
+    fn close_open_text_blocks(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+
+        // 收集要关闭的 text 块索引，避免借用冲突
+        let open_text_indices: Vec<i32> = self
+            .state_manager
+            .active_blocks
+            .iter()
+            .filter_map(|(index, block)| {
+                (block.block_type == "text" && block.started && !block.stopped).then_some(*index)
+            })
+            .collect();
+
+        for index in open_text_indices {
+            if let Some(stop_event) = self.state_manager.handle_content_block_stop(index) {
+                events.push(stop_event);
+            }
+        }
+
+        // 当前 text_block_index 若指向已关闭块，后续 create_text_delta_events 会自愈，但这里直接清空更明确
+        self.text_block_index = None;
 
         events
     }
@@ -1020,6 +1029,128 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(&buffered));
         }
 
+        let tool_name_lower = tool_use.name.to_lowercase();
+        let is_write_tool = tool_name_lower == "write";
+
+        // Write 工具：不要立即发送 tool_use content_block_start，避免截断/超限时客户端收到空调用。
+        // 为保持块顺序一致，在收到 Write 工具输入时先关闭已有 text 块（等价于 tool_use 开始前的自动关闭行为）。
+        if is_write_tool {
+            events.extend(self.close_open_text_blocks());
+        }
+
+        // 累积工具输入到缓冲区
+        let buffer = self
+            .tool_input_buffers
+            .entry(tool_use.tool_use_id.clone())
+            .or_insert_with(|| (tool_use.name.clone(), String::new(), false));
+        buffer.1.push_str(&tool_use.input);
+
+        if tool_use.stop {
+            buffer.2 = true;
+        }
+
+        // 估算 token（与是否发送 delta 无关）
+        if !tool_use.input.is_empty() {
+            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4;
+        }
+
+        // Write 工具：为避免截断导致 JSON 不完整，延迟发送 tool_use 相关事件，直到 stop=true 且校验通过
+        if is_write_tool {
+            if tool_use.stop {
+                let input_json = buffer.1.as_str();
+
+                // 检查 JSON 是否完整
+                if !is_json_complete(input_json) {
+                    tracing::warn!(
+                        "Write工具调用被截断(JSON不完整): tool_id={}, input_len={}",
+                        tool_use.tool_use_id,
+                        input_json.len()
+                    );
+                    events.extend(self.create_truncated_tool_error_events(&tool_use.name));
+                    return events;
+                }
+
+                // 检查 content 字段的 token 数
+                match serde_json::from_str::<serde_json::Value>(input_json) {
+                    Ok(json_val) => {
+                        if let Some(content) = json_val.get("content").and_then(|v| v.as_str()) {
+                            let estimated_tokens = estimate_tokens(content);
+                            if estimated_tokens > WRITE_TOOL_TOKEN_LIMIT {
+                                tracing::warn!(
+                                    "Write工具内容过大: tool_id={}, tokens={}, limit={}",
+                                    tool_use.tool_use_id,
+                                    estimated_tokens,
+                                    WRITE_TOOL_TOKEN_LIMIT
+                                );
+                                events.extend(self.create_truncated_tool_error_events(&tool_use.name));
+                                return events;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Write工具调用JSON解析失败(可能被截断): tool_id={}, input_len={}, err={}",
+                            tool_use.tool_use_id,
+                            input_json.len(),
+                            err
+                        );
+                        events.extend(self.create_truncated_tool_error_events(&tool_use.name));
+                        return events;
+                    }
+                }
+
+                // 校验通过：一次性发送 content_block_start + 完整 input_json_delta + content_block_stop
+                let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id)
+                {
+                    idx
+                } else {
+                    let idx = self.state_manager.next_block_index();
+                    self.tool_block_indices
+                        .insert(tool_use.tool_use_id.clone(), idx);
+                    idx
+                };
+
+                let start_events = self.state_manager.handle_content_block_start(
+                    block_index,
+                    "tool_use",
+                    json!({
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tool_use.tool_use_id,
+                            "name": tool_use.name,
+                            "input": {}
+                        }
+                    }),
+                );
+                events.extend(start_events);
+
+                if !input_json.is_empty() {
+                    if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+                        block_index,
+                        json!({
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": input_json
+                            }
+                        }),
+                    ) {
+                        events.push(delta_event);
+                    }
+                }
+
+                if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
+                    events.push(stop_event);
+                }
+            }
+
+            return events;
+        }
+
+        // 非 Write 工具：逻辑保持不变（立即发送 tool_use content_block_start + 增量 input_json_delta）
         // 获取或分配块索引
         let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
             idx
@@ -1046,102 +1177,6 @@ impl StreamContext {
             }),
         );
         events.extend(start_events);
-
-        // 累积工具输入到缓冲区
-        let buffer = self
-            .tool_input_buffers
-            .entry(tool_use.tool_use_id.clone())
-            .or_insert_with(|| (tool_use.name.clone(), String::new(), false));
-        buffer.1.push_str(&tool_use.input);
-
-        if tool_use.stop {
-            buffer.2 = true;
-        }
-
-        // 估算 token（与是否发送 delta 无关）
-        if !tool_use.input.is_empty() {
-            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4;
-        }
-
-        let tool_name_lower = tool_use.name.to_lowercase();
-        let is_write_tool = tool_name_lower == "write";
-
-        // Write 工具：为避免截断导致 JSON 不完整，延迟发送 input_json_delta，直到 stop=true 且校验通过
-        if is_write_tool {
-            if tool_use.stop {
-                let input_json = buffer.1.as_str();
-
-                // 检查 JSON 是否完整
-                if !is_json_complete(input_json) {
-                    tracing::warn!(
-                        "Write工具调用被截断(JSON不完整): tool_id={}, input_len={}",
-                        tool_use.tool_use_id,
-                        input_json.len()
-                    );
-                    events.extend(
-                        self.create_truncated_tool_error_events(block_index, &tool_use.name),
-                    );
-                    return events;
-                }
-
-                // 检查 content 字段的 token 数
-                match serde_json::from_str::<serde_json::Value>(input_json) {
-                    Ok(json_val) => {
-                        if let Some(content) = json_val.get("content").and_then(|v| v.as_str()) {
-                            let estimated_tokens = estimate_tokens(content);
-                            if estimated_tokens > WRITE_TOOL_TOKEN_LIMIT {
-                                tracing::warn!(
-                                    "Write工具内容过大: tool_id={}, tokens={}, limit={}",
-                                    tool_use.tool_use_id,
-                                    estimated_tokens,
-                                    WRITE_TOOL_TOKEN_LIMIT
-                                );
-                                events.extend(self.create_truncated_tool_error_events(
-                                    block_index,
-                                    &tool_use.name,
-                                ));
-                                return events;
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            "Write工具调用JSON解析失败(可能被截断): tool_id={}, input_len={}, err={}",
-                            tool_use.tool_use_id,
-                            input_json.len(),
-                            err
-                        );
-                        events.extend(
-                            self.create_truncated_tool_error_events(block_index, &tool_use.name),
-                        );
-                        return events;
-                    }
-                }
-
-                // 校验通过：发送完整工具输入（一次性）
-                if !input_json.is_empty() {
-                    if let Some(delta_event) = self.state_manager.handle_content_block_delta(
-                        block_index,
-                        json!({
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": input_json
-                            }
-                        }),
-                    ) {
-                        events.push(delta_event);
-                    }
-                }
-
-                if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
-                    events.push(stop_event);
-                }
-            }
-
-            return events;
-        }
 
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
         if !tool_use.input.is_empty() {
@@ -1197,13 +1232,11 @@ impl StreamContext {
             .collect();
 
         for (tool_id, tool_name) in pending_write_tools {
-            if let Some(&block_index) = self.tool_block_indices.get(&tool_id) {
-                tracing::warn!(
-                    "检测到未完成的Write工具调用(流提前结束): tool_id={}",
-                    tool_id
-                );
-                events.extend(self.create_truncated_tool_error_events(block_index, &tool_name));
-            }
+            tracing::warn!(
+                "检测到未完成的Write工具调用(流提前结束): tool_id={}",
+                tool_id
+            );
+            events.extend(self.create_truncated_tool_error_events(&tool_name));
         }
 
         // Flush thinking_buffer 中的剩余内容
@@ -1468,7 +1501,7 @@ mod tests {
         );
 
         let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-            name: "Write".to_string(),
+            name: "test_tool".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
             stop: false,
@@ -1568,6 +1601,12 @@ mod tests {
             0,
             "truncated Write tool call must not emit input_json_delta"
         );
+        assert!(
+            events.iter().all(|e| {
+                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use")
+            }),
+            "truncated Write tool call must not emit tool_use content_block_start"
+        );
 
         let expected_text = format!(
             "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。",
@@ -1602,16 +1641,9 @@ mod tests {
             "should stop the truncation text block"
         );
 
-        let block_index = *ctx
-            .tool_block_indices
-            .get("tool_1")
-            .expect("tool block index should exist");
         assert!(
-            events.iter().any(|e| {
-                e.event == "content_block_stop"
-                    && e.data["index"].as_i64() == Some(block_index as i64)
-            }),
-            "should stop the tool_use block"
+            ctx.tool_block_indices.get("tool_1").is_none(),
+            "tool block index must not be allocated when Write tool validation fails"
         );
 
         assert_eq!(
@@ -1636,6 +1668,12 @@ mod tests {
             tool_events.iter().all(|e| e.data["delta"]["type"] != "input_json_delta"),
             "Write tool input should be buffered and not streamed before stop=true"
         );
+        assert!(
+            tool_events.iter().all(|e| {
+                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use")
+            }),
+            "Write tool must not emit tool_use content_block_start before stop=true"
+        );
 
         let final_events = ctx.generate_final_events();
         let input_deltas: Vec<&SseEvent> = final_events
@@ -1648,6 +1686,12 @@ mod tests {
             input_deltas.len(),
             0,
             "truncated Write tool call must not emit input_json_delta on final flush"
+        );
+        assert!(
+            final_events.iter().all(|e| {
+                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use")
+            }),
+            "truncated Write tool call must not emit tool_use content_block_start on final flush"
         );
 
         let expected_text = format!(
@@ -1705,6 +1749,12 @@ mod tests {
             0,
             "truncated Write tool call must not emit input_json_delta"
         );
+        assert!(
+            events.iter().all(|e| {
+                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use")
+            }),
+            "over-limit Write tool call must not emit tool_use content_block_start"
+        );
 
         let expected_text = format!(
             "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。",
@@ -1723,6 +1773,78 @@ mod tests {
             ctx.state_manager.get_stop_reason(),
             "end_turn",
             "stop_reason must be end_turn after truncation"
+        );
+    }
+
+    #[test]
+    fn test_write_tool_emits_complete_tool_block_only_on_stop_after_validation() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false);
+        let _initial_events = ctx.generate_initial_events();
+
+        let chunk1 = r#"{"path":"a","content":"ab"#.to_string();
+        let chunk2 = r#"c"}"#.to_string();
+        let full_json = r#"{"path":"a","content":"abc"}"#;
+
+        let events1 = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: chunk1,
+            stop: false,
+        });
+        assert!(
+            events1.iter().all(|e| {
+                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use")
+            }),
+            "Write tool must not start tool_use block before stop=true"
+        );
+        assert!(
+            events1.iter().all(|e| {
+                !(e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta")
+            }),
+            "Write tool must not stream input_json_delta before stop=true"
+        );
+
+        let events2 = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: chunk2,
+            stop: true,
+        });
+
+        let tool_start = events2
+            .iter()
+            .find(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use")
+            .expect("should emit tool_use content_block_start on stop=true");
+        let tool_index = tool_start.data["index"]
+            .as_i64()
+            .expect("tool_use start must contain index");
+
+        let input_deltas: Vec<&SseEvent> = events2
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+            })
+            .collect();
+        assert_eq!(
+            input_deltas.len(),
+            1,
+            "should emit exactly one input_json_delta for Write tool on stop=true"
+        );
+        assert_eq!(
+            input_deltas[0].data["delta"]["partial_json"],
+            full_json,
+            "input_json_delta must contain the complete JSON payload"
+        );
+        assert!(
+            events2.iter().any(|e| {
+                e.event == "content_block_stop" && e.data["index"].as_i64() == Some(tool_index)
+            }),
+            "should stop the tool_use block after emitting the full JSON"
+        );
+        assert_eq!(
+            ctx.tool_block_indices.get("tool_1").copied(),
+            Some(tool_index as i32),
+            "tool_block_indices should record the emitted tool_use block index"
         );
     }
 
@@ -1860,7 +1982,7 @@ mod tests {
         all_events.extend(ctx.process_assistant_response("<thinking>abc</thinking>"));
 
         let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-            name: "Write".to_string(),
+            name: "test_tool".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
             stop: false,
