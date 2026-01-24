@@ -465,6 +465,8 @@ pub struct StreamContext {
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
+    /// 工具输入缓冲区 (tool_id -> (tool_name, accumulated_input, is_completed))
+    pub tool_input_buffers: HashMap<String, (String, String, bool)>,
     /// thinking 是否启用
     pub thinking_enabled: bool,
     /// thinking 内容缓冲区
@@ -494,6 +496,7 @@ impl StreamContext {
             context_input_tokens: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
+            tool_input_buffers: HashMap::new(),
             thinking_enabled,
             thinking_buffer: String::new(),
             in_thinking_block: false,
@@ -818,6 +821,52 @@ impl StreamContext {
         )
     }
 
+    /// 创建截断工具的错误事件（替换原有工具调用）
+    fn create_truncated_tool_error_events(
+        &mut self,
+        block_index: i32,
+        tool_name: &str,
+    ) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+
+        // 构造错误 JSON 作为工具输入（避免拼接时破坏 JSON 转义）
+        let error_input = serde_json::to_string(&json!({
+            "error": "CONTENT_TOO_LARGE",
+            "message": format!(
+                "{}工具调用失败：不允许一次性写入超过{}个token，请分批写入",
+                tool_name, WRITE_TOOL_TOKEN_LIMIT
+            )
+        }))
+        .unwrap_or_else(|_| {
+            // 极端情况下序列化失败，退化为一个最小、可解析的 JSON
+            format!(
+                r#"{{"error":"CONTENT_TOO_LARGE","message":"{}工具调用失败：不允许一次性写入超过{}个token，请分批写入"}}"#,
+                tool_name, WRITE_TOOL_TOKEN_LIMIT
+            )
+        });
+
+        if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+            block_index,
+            json!({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": error_input
+                }
+            }),
+        ) {
+            events.push(delta_event);
+        }
+
+        // 关闭工具块
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
+            events.push(stop_event);
+        }
+
+        events
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -906,10 +955,104 @@ impl StreamContext {
         );
         events.extend(start_events);
 
+        // 累积工具输入到缓冲区
+        let buffer = self
+            .tool_input_buffers
+            .entry(tool_use.tool_use_id.clone())
+            .or_insert_with(|| (tool_use.name.clone(), String::new(), false));
+        buffer.1.push_str(&tool_use.input);
+
+        if tool_use.stop {
+            buffer.2 = true;
+        }
+
+        // 估算 token（与是否发送 delta 无关）
+        if !tool_use.input.is_empty() {
+            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4;
+        }
+
+        let tool_name_lower = tool_use.name.to_lowercase();
+        let is_write_tool = tool_name_lower == "write";
+
+        // Write 工具：为避免截断导致 JSON 不完整，延迟发送 input_json_delta，直到 stop=true 且校验通过
+        if is_write_tool {
+            if tool_use.stop {
+                let input_json = buffer.1.as_str();
+
+                // 检查 JSON 是否完整
+                if !is_json_complete(input_json) {
+                    tracing::warn!(
+                        "Write工具调用被截断(JSON不完整): tool_id={}, input_len={}",
+                        tool_use.tool_use_id,
+                        input_json.len()
+                    );
+                    events.extend(
+                        self.create_truncated_tool_error_events(block_index, &tool_use.name),
+                    );
+                    return events;
+                }
+
+                // 检查 content 字段的 token 数
+                match serde_json::from_str::<serde_json::Value>(input_json) {
+                    Ok(json_val) => {
+                        if let Some(content) = json_val.get("content").and_then(|v| v.as_str()) {
+                            let estimated_tokens = estimate_tokens(content);
+                            if estimated_tokens > WRITE_TOOL_TOKEN_LIMIT {
+                                tracing::warn!(
+                                    "Write工具内容过大: tool_id={}, tokens={}, limit={}",
+                                    tool_use.tool_use_id,
+                                    estimated_tokens,
+                                    WRITE_TOOL_TOKEN_LIMIT
+                                );
+                                events.extend(self.create_truncated_tool_error_events(
+                                    block_index,
+                                    &tool_use.name,
+                                ));
+                                return events;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Write工具调用JSON解析失败(可能被截断): tool_id={}, input_len={}, err={}",
+                            tool_use.tool_use_id,
+                            input_json.len(),
+                            err
+                        );
+                        events.extend(
+                            self.create_truncated_tool_error_events(block_index, &tool_use.name),
+                        );
+                        return events;
+                    }
+                }
+
+                // 校验通过：发送完整工具输入（一次性）
+                if !input_json.is_empty() {
+                    if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+                        block_index,
+                        json!({
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": input_json
+                            }
+                        }),
+                    ) {
+                        events.push(delta_event);
+                    }
+                }
+
+                if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
+                    events.push(stop_event);
+                }
+            }
+
+            return events;
+        }
+
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
         if !tool_use.input.is_empty() {
-            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
-
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
                 json!({
@@ -938,6 +1081,26 @@ impl StreamContext {
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // 检查未完成的 Write 工具调用（可能被截断导致 stop=true 从未到达）
+        let pending_write_tools: Vec<(String, String)> = self
+            .tool_input_buffers
+            .iter()
+            .filter_map(|(tool_id, (tool_name, _input, completed))| {
+                (!*completed && tool_name.to_lowercase() == "write")
+                    .then(|| (tool_id.clone(), tool_name.clone()))
+            })
+            .collect();
+
+        for (tool_id, tool_name) in pending_write_tools {
+            if let Some(&block_index) = self.tool_block_indices.get(&tool_id) {
+                tracing::warn!(
+                    "检测到未完成的Write工具调用(流提前结束): tool_id={}",
+                    tool_id
+                );
+                events.extend(self.create_truncated_tool_error_events(block_index, &tool_name));
+            }
+        }
 
         // Flush thinking_buffer 中的剩余内容
         if self.thinking_enabled && !self.thinking_buffer.is_empty() {
@@ -1012,6 +1175,45 @@ impl StreamContext {
         events
     }
 }
+
+/// 检查 JSON 字符串是否完整（括号平衡）
+fn is_json_complete(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+
+    let mut brace_count = 0i32;
+    let mut bracket_count = 0i32;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for c in s.chars() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+
+        match c {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => brace_count += 1,
+            '}' if !in_string => brace_count -= 1,
+            '[' if !in_string => bracket_count += 1,
+            ']' if !in_string => bracket_count -= 1,
+            _ => {}
+        }
+
+        if brace_count < 0 || bracket_count < 0 {
+            return false;
+        }
+    }
+
+    brace_count == 0 && bracket_count == 0 && !in_string
+}
+
+/// Write 工具内容 token 上限
+const WRITE_TOOL_TOKEN_LIMIT: i32 = 8000;
 
 /// 简单的 token 估算
 fn estimate_tokens(text: &str) -> i32 {
@@ -1225,6 +1427,132 @@ mod tests {
         assert!(estimate_tokens("Hello") > 0);
         assert!(estimate_tokens("你好") > 0);
         assert!(estimate_tokens("Hello 你好") > 0);
+    }
+
+    #[test]
+    fn test_is_json_complete_basic() {
+        assert!(is_json_complete(r#"{"a":1}"#));
+        assert!(is_json_complete(r#"[{"a":"b"}]"#));
+        assert!(is_json_complete(r#"{"a":"b\\\"c"}"#));
+
+        assert!(!is_json_complete(r#"{"a":1"#));
+        assert!(!is_json_complete(r#"{"a":"unterminated}"#));
+        assert!(!is_json_complete(""));
+        assert!(!is_json_complete("   "));
+    }
+
+    #[test]
+    fn test_write_tool_incomplete_json_on_stop_is_replaced_with_error() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false);
+        let _initial_events = ctx.generate_initial_events();
+
+        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: r#"{"path":"a","content":"abc""#.to_string(),
+            stop: true,
+        });
+
+        let input_deltas: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta")
+            .collect();
+        assert_eq!(input_deltas.len(), 1, "should emit exactly one input_json_delta");
+
+        let partial = input_deltas[0].data["delta"]["partial_json"]
+            .as_str()
+            .expect("partial_json should be a string");
+        assert!(
+            partial.contains(r#""error":"CONTENT_TOO_LARGE""#),
+            "should replace truncated Write tool input with error JSON"
+        );
+        assert!(
+            !partial.contains(r#""content":"abc""#),
+            "error JSON must not contain original truncated content"
+        );
+
+        let block_index = *ctx
+            .tool_block_indices
+            .get("tool_1")
+            .expect("tool block index should exist");
+        assert!(
+            events.iter().any(|e| {
+                e.event == "content_block_stop"
+                    && e.data["index"].as_i64() == Some(block_index as i64)
+            }),
+            "should stop the tool_use block"
+        );
+    }
+
+    #[test]
+    fn test_write_tool_stream_end_without_stop_is_replaced_with_error() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false);
+        let _initial_events = ctx.generate_initial_events();
+
+        let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: r#"{"path":"a","content":"abc""#.to_string(),
+            stop: false,
+        });
+        assert!(
+            tool_events.iter().all(|e| e.data["delta"]["type"] != "input_json_delta"),
+            "Write tool input should be buffered and not streamed before stop=true"
+        );
+
+        let final_events = ctx.generate_final_events();
+        let input_deltas: Vec<&SseEvent> = final_events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta")
+            .collect();
+        assert_eq!(input_deltas.len(), 1, "should emit one error input_json_delta on final flush");
+
+        let partial = input_deltas[0].data["delta"]["partial_json"]
+            .as_str()
+            .expect("partial_json should be a string");
+        assert!(
+            partial.contains(r#""error":"CONTENT_TOO_LARGE""#),
+            "should replace incomplete Write tool input with error JSON at stream end"
+        );
+    }
+
+    #[test]
+    fn test_write_tool_content_over_limit_is_replaced_with_error() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false);
+        let _initial_events = ctx.generate_initial_events();
+
+        // 12001 个中文字符约为 8001 tokens（按 estimate_tokens 的近似）
+        let content = "你".repeat(12_001);
+        let input = serde_json::to_string(&json!({
+            "path": "a",
+            "content": content
+        }))
+        .expect("should serialize input json");
+
+        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input,
+            stop: true,
+        });
+
+        let input_deltas: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta")
+            .collect();
+        assert_eq!(input_deltas.len(), 1, "should emit exactly one input_json_delta");
+
+        let partial = input_deltas[0].data["delta"]["partial_json"]
+            .as_str()
+            .expect("partial_json should be a string");
+        assert!(
+            partial.contains("不允许一次性写入超过"),
+            "error message should mention token limit"
+        );
+        assert!(
+            partial.contains(&WRITE_TOOL_TOKEN_LIMIT.to_string()),
+            "error message should include the token limit value"
+        );
     }
 
     #[test]
