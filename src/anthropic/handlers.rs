@@ -247,6 +247,17 @@ fn create_sse_stream(
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    create_sse_stream_from_body_stream(response.bytes_stream(), ctx, initial_events)
+}
+
+fn create_sse_stream_from_body_stream<BS>(
+    body_stream: BS,
+    ctx: StreamContext,
+    initial_events: Vec<SseEvent>,
+) -> impl Stream<Item = Result<Bytes, Infallible>>
+where
+    BS: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
     // 先发送初始事件
     let initial_stream = stream::iter(
         initial_events
@@ -255,10 +266,14 @@ fn create_sse_stream(
     );
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
-    let body_stream = response.bytes_stream();
-
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
+        (
+            body_stream,
+            ctx,
+            EventStreamDecoder::new(),
+            false,
+            interval(Duration::from_secs(PING_INTERVAL_SECS)),
+        ),
         |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
             if finished {
                 return None;
@@ -276,12 +291,19 @@ fn create_sse_stream(
                             }
 
                             let mut events = Vec::new();
+                            let mut should_finish = false;
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
                                         if let Ok(event) = Event::from_frame(frame) {
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
+                                            if matches!(event, Event::ToolUse(tool_use) if tool_use.stop) {
+                                                // Claude Code/Anthropic 的语义：一旦输出 tool_use（stop=true），当前消息应以 stop_reason=tool_use 结束。
+                                                // 如果上游在 tool_use 后不主动关闭连接，客户端会一直等待 message_stop 而卡死。
+                                                should_finish = true;
+                                                break;
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -290,13 +312,17 @@ fn create_sse_stream(
                                 }
                             }
 
+                            if should_finish {
+                                events.extend(ctx.generate_final_events());
+                            }
+
                             // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, should_finish, ping_interval)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -777,4 +803,88 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::kiro::parser::crc::crc32;
+    use futures::{StreamExt, stream};
+
+    fn encode_string_header(name: &str, value: &str, out: &mut Vec<u8>) {
+        let name_bytes = name.as_bytes();
+        out.push(name_bytes.len() as u8);
+        out.extend_from_slice(name_bytes);
+        // HeaderValueType::String = 7
+        out.push(7u8);
+        let value_bytes = value.as_bytes();
+        out.extend_from_slice(&(value_bytes.len() as u16).to_be_bytes());
+        out.extend_from_slice(value_bytes);
+    }
+
+    fn build_event_frame(event_type: &str, payload: serde_json::Value) -> Bytes {
+        let mut headers = Vec::new();
+        encode_string_header(":message-type", "event", &mut headers);
+        encode_string_header(":event-type", event_type, &mut headers);
+
+        let payload = serde_json::to_vec(&payload).expect("payload should serialize");
+        let total_length = (12 + headers.len() + payload.len() + 4) as u32;
+
+        let mut message = Vec::new();
+        message.extend_from_slice(&total_length.to_be_bytes());
+        message.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+
+        let prelude_crc = crc32(&message);
+        message.extend_from_slice(&prelude_crc.to_be_bytes());
+        message.extend_from_slice(&headers);
+        message.extend_from_slice(&payload);
+
+        let message_crc = crc32(&message);
+        message.extend_from_slice(&message_crc.to_be_bytes());
+
+        Bytes::from(message)
+    }
+
+    #[tokio::test]
+    async fn test_stream_finishes_after_tool_use_stop_even_if_upstream_stalls() {
+        let frame = build_event_frame(
+            "toolUseEvent",
+            json!({
+                "name": "Write",
+                "toolUseId": "tool_1",
+                "input": r#"{"path":"a","content":"ok"}"#,
+                "stop": true
+            }),
+        );
+
+        // 上游发送一个 toolUseEvent 后就不再继续（模拟连接不关闭/卡住）
+        let body_stream = stream::iter(vec![Ok(frame)])
+            .chain(stream::pending::<Result<Bytes, reqwest::Error>>());
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false);
+        let initial_events = ctx.generate_initial_events();
+
+        let sse_stream = create_sse_stream_from_body_stream(body_stream, ctx, initial_events);
+
+        // 如果不在 tool_use(stop=true) 后主动结束消息，这里会一直 pending 导致超时
+        let chunks = tokio::time::timeout(Duration::from_secs(1), sse_stream.collect::<Vec<_>>())
+            .await
+            .expect("stream should finish after tool_use(stop=true)");
+
+        let joined = chunks
+            .into_iter()
+            .map(|r| r.expect("sse chunk should be Ok"))
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<String>();
+
+        assert!(
+            joined.contains("event: message_stop"),
+            "should emit message_stop to let client proceed"
+        );
+        assert!(
+            joined.contains("\"stop_reason\":\"tool_use\""),
+            "should set stop_reason to tool_use when tool_use was emitted"
+        );
+    }
 }
