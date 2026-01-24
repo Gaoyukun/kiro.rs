@@ -898,9 +898,10 @@ impl StreamContext {
             "create_truncated_tool_error_events 被调用"
         );
 
-        // 关键：不要再发送任何 input_json_delta（否则客户端会把它当作工具调用去执行）。
-        // 这里将 tool_use 块收尾，然后输出一个普通 text 块作为“系统提示”，并以 end_turn 结束消息。
-        self.state_manager.set_stop_reason("end_turn");
+        // 关键：为了让 client 继续（而不是收到 end_turn 直接停止），这里输出“系统提示”文本，
+        // 并追加一个占位 tool_use（Read + 占位路径），最终 stop_reason 设为 tool_use。
+        self.state_manager.set_has_tool_use(true);
+        self.state_manager.set_stop_reason("tool_use");
 
         // 创建新的 text 块并立即关闭，避免残留未关闭的块状态影响 message_delta
         let text_index = self.state_manager.next_block_index();
@@ -918,7 +919,7 @@ impl StreamContext {
         ));
 
         let text = format!(
-            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。",
+            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。\n\n注意：下面的工具调用不是我自发的行为，只是为了触发对话继续的占位符，请忽略其结果并直接开始重新生成内容。",
             WRITE_TOOL_TOKEN_LIMIT, WRITE_TOOL_TOKEN_LIMIT
         );
         if let Some(delta_event) = self.state_manager.handle_content_block_delta(
@@ -936,6 +937,43 @@ impl StreamContext {
         }
 
         if let Some(stop_event) = self.state_manager.handle_content_block_stop(text_index) {
+            events.push(stop_event);
+        }
+
+        // 占位 tool_use：用于触发 client 继续发起下一轮（忽略其结果）
+        let tool_use_id = Uuid::new_v4().to_string();
+        let tool_index = self.state_manager.next_block_index();
+        events.extend(self.state_manager.handle_content_block_start(
+            tool_index,
+            "tool_use",
+            json!({
+                "type": "content_block_start",
+                "index": tool_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": "Read",
+                    "input": {}
+                }
+            }),
+        ));
+
+        let placeholder_input = r#"{"file_path": "/__placeholder_to_trigger_continue__"}"#;
+        if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+            tool_index,
+            json!({
+                "type": "content_block_delta",
+                "index": tool_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": placeholder_input
+                }
+            }),
+        ) {
+            events.push(delta_event);
+        }
+
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(tool_index) {
             events.push(stop_event);
         }
 
@@ -1686,18 +1724,42 @@ mod tests {
             .collect();
         assert_eq!(
             input_deltas.len(),
-            0,
-            "truncated Write tool call must not emit input_json_delta"
+            1,
+            "should emit one placeholder input_json_delta to trigger client continuation"
+        );
+        assert_eq!(
+            input_deltas[0].data["delta"]["partial_json"].as_str(),
+            Some(r#"{"file_path": "/__placeholder_to_trigger_continue__"}"#),
+            "placeholder input_json_delta should contain the placeholder Read input"
+        );
+
+        let tool_use_starts: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .collect();
+        assert_eq!(
+            tool_use_starts.len(),
+            1,
+            "should emit one placeholder tool_use content_block_start"
+        );
+        assert_eq!(
+            tool_use_starts[0].data["content_block"]["name"].as_str(),
+            Some("Read"),
+            "placeholder tool_use must be Read"
         );
         assert!(
             events.iter().all(|e| {
-                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use")
+                !(e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "tool_use"
+                    && e.data["content_block"]["name"] == "Write")
             }),
-            "truncated Write tool call must not emit tool_use content_block_start"
+            "should not emit the original Write tool_use content_block_start"
         );
 
         let expected_text = format!(
-            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。",
+            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。\n\n注意：下面的工具调用不是我自发的行为，只是为了触发对话继续的占位符，请忽略其结果并直接开始重新生成内容。",
             WRITE_TOOL_TOKEN_LIMIT, WRITE_TOOL_TOKEN_LIMIT
         );
         assert!(
@@ -1736,8 +1798,8 @@ mod tests {
 
         assert_eq!(
             ctx.state_manager.get_stop_reason(),
-            "end_turn",
-            "stop_reason must be end_turn after truncation"
+            "tool_use",
+            "stop_reason must be tool_use after truncation"
         );
     }
 
@@ -1772,18 +1834,42 @@ mod tests {
             .collect();
         assert_eq!(
             input_deltas.len(),
-            0,
-            "truncated Write tool call must not emit input_json_delta on final flush"
+            1,
+            "should emit one placeholder input_json_delta on final flush"
+        );
+        assert_eq!(
+            input_deltas[0].data["delta"]["partial_json"].as_str(),
+            Some(r#"{"file_path": "/__placeholder_to_trigger_continue__"}"#),
+            "placeholder input_json_delta should contain the placeholder Read input"
+        );
+
+        let tool_use_starts: Vec<&SseEvent> = final_events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .collect();
+        assert_eq!(
+            tool_use_starts.len(),
+            1,
+            "should emit one placeholder tool_use content_block_start on final flush"
+        );
+        assert_eq!(
+            tool_use_starts[0].data["content_block"]["name"].as_str(),
+            Some("Read"),
+            "placeholder tool_use must be Read"
         );
         assert!(
             final_events.iter().all(|e| {
-                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use")
+                !(e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "tool_use"
+                    && e.data["content_block"]["name"] == "Write")
             }),
-            "truncated Write tool call must not emit tool_use content_block_start on final flush"
+            "should not emit the original Write tool_use content_block_start on final flush"
         );
 
         let expected_text = format!(
-            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。",
+            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。\n\n注意：下面的工具调用不是我自发的行为，只是为了触发对话继续的占位符，请忽略其结果并直接开始重新生成内容。",
             WRITE_TOOL_TOKEN_LIMIT, WRITE_TOOL_TOKEN_LIMIT
         );
         assert!(
@@ -1795,14 +1881,108 @@ mod tests {
             "should emit a text_delta with the truncation system prompt at stream end"
         );
 
+        // Ensure event order: text block -> tool_use -> message_delta(tool_use) -> message_stop
+        let text_delta_pos = final_events.iter().position(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"] == expected_text
+        });
+        assert!(
+            text_delta_pos.is_some(),
+            "should contain truncation text_delta"
+        );
+        let text_delta_pos = text_delta_pos.unwrap();
+
+        let text_start_pos = final_events.iter().take(text_delta_pos).position(|e| {
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+        });
+        assert!(
+            text_start_pos.is_some(),
+            "text_delta should be preceded by a text content_block_start"
+        );
+        let text_start_pos = text_start_pos.unwrap();
+
+        let text_index = final_events[text_start_pos]
+            .data["index"]
+            .as_i64()
+            .expect("text start must have index");
+        let text_stop_pos = final_events.iter().position(|e| {
+            e.event == "content_block_stop" && e.data["index"].as_i64() == Some(text_index)
+        });
+        assert!(
+            text_stop_pos.is_some(),
+            "text block should be stopped"
+        );
+        let text_stop_pos = text_stop_pos.unwrap();
+        assert!(
+            text_start_pos < text_delta_pos && text_delta_pos < text_stop_pos,
+            "text block events should be start -> delta -> stop"
+        );
+
+        let tool_start_pos = final_events.iter().position(|e| {
+            e.event == "content_block_start"
+                && e.data["content_block"]["type"] == "tool_use"
+                && e.data["content_block"]["name"] == "Read"
+        });
+        assert!(
+            tool_start_pos.is_some(),
+            "should contain placeholder Read tool_use start"
+        );
+        let tool_start_pos = tool_start_pos.unwrap();
+
+        let tool_index = final_events[tool_start_pos]
+            .data["index"]
+            .as_i64()
+            .expect("tool_use start must have index");
+        let tool_delta_pos = final_events.iter().position(|e| {
+            e.event == "content_block_delta"
+                && e.data["index"].as_i64() == Some(tool_index)
+                && e.data["delta"]["type"] == "input_json_delta"
+                && e.data["delta"]["partial_json"]
+                    == r#"{"file_path": "/__placeholder_to_trigger_continue__"}"#
+        });
+        assert!(
+            tool_delta_pos.is_some(),
+            "should contain placeholder input_json_delta for Read"
+        );
+        let tool_delta_pos = tool_delta_pos.unwrap();
+
+        let tool_stop_pos = final_events.iter().position(|e| {
+            e.event == "content_block_stop" && e.data["index"].as_i64() == Some(tool_index)
+        });
+        assert!(
+            tool_stop_pos.is_some(),
+            "tool_use block should be stopped"
+        );
+        let tool_stop_pos = tool_stop_pos.unwrap();
+        assert!(
+            tool_start_pos < tool_delta_pos && tool_delta_pos < tool_stop_pos,
+            "tool_use block events should be start -> delta -> stop"
+        );
+
+        let message_delta_pos = final_events
+            .iter()
+            .position(|e| e.event == "message_delta")
+            .expect("should contain message_delta");
+        let message_stop_pos = final_events
+            .iter()
+            .position(|e| e.event == "message_stop")
+            .expect("should contain message_stop");
+        assert!(
+            text_stop_pos < tool_start_pos
+                && tool_stop_pos < message_delta_pos
+                && message_delta_pos < message_stop_pos,
+            "final event order should be text -> tool_use -> message_delta -> message_stop"
+        );
+
         let message_delta = final_events
             .iter()
             .find(|e| e.event == "message_delta")
             .expect("should contain message_delta");
         assert_eq!(
             message_delta.data["delta"]["stop_reason"],
-            "end_turn",
-            "stop_reason must be end_turn after truncation"
+            "tool_use",
+            "stop_reason must be tool_use after truncation"
         );
     }
 
@@ -1834,18 +2014,42 @@ mod tests {
             .collect();
         assert_eq!(
             input_deltas.len(),
-            0,
-            "truncated Write tool call must not emit input_json_delta"
+            1,
+            "should emit one placeholder input_json_delta to trigger client continuation"
+        );
+        assert_eq!(
+            input_deltas[0].data["delta"]["partial_json"].as_str(),
+            Some(r#"{"file_path": "/__placeholder_to_trigger_continue__"}"#),
+            "placeholder input_json_delta should contain the placeholder Read input"
+        );
+
+        let tool_use_starts: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .collect();
+        assert_eq!(
+            tool_use_starts.len(),
+            1,
+            "should emit one placeholder tool_use content_block_start"
+        );
+        assert_eq!(
+            tool_use_starts[0].data["content_block"]["name"].as_str(),
+            Some("Read"),
+            "placeholder tool_use must be Read"
         );
         assert!(
             events.iter().all(|e| {
-                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use")
+                !(e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "tool_use"
+                    && e.data["content_block"]["name"] == "Write")
             }),
-            "over-limit Write tool call must not emit tool_use content_block_start"
+            "should not emit the original Write tool_use content_block_start"
         );
 
         let expected_text = format!(
-            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。",
+            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。\n\n注意：下面的工具调用不是我自发的行为，只是为了触发对话继续的占位符，请忽略其结果并直接开始重新生成内容。",
             WRITE_TOOL_TOKEN_LIMIT, WRITE_TOOL_TOKEN_LIMIT
         );
         assert!(
@@ -1859,8 +2063,8 @@ mod tests {
 
         assert_eq!(
             ctx.state_manager.get_stop_reason(),
-            "end_turn",
-            "stop_reason must be end_turn after truncation"
+            "tool_use",
+            "stop_reason must be tool_use after truncation"
         );
     }
 
