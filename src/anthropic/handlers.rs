@@ -298,11 +298,19 @@ where
                                         if let Ok(event) = Event::from_frame(frame) {
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
-                                            if matches!(event, Event::ToolUse(tool_use) if tool_use.stop) {
-                                                // Claude Code/Anthropic 的语义：一旦输出 tool_use（stop=true），当前消息应以 stop_reason=tool_use 结束。
-                                                // 如果上游在 tool_use 后不主动关闭连接，客户端会一直等待 message_stop 而卡死。
-                                                should_finish = true;
-                                                break;
+                                            if let Event::ToolUse(tool_use) = &event {
+                                                if tool_use.stop {
+                                                    // Claude Code/Anthropic 的语义：一旦输出 tool_use（stop=true），当前消息应以 stop_reason=tool_use 结束。
+                                                    // 如果上游在 tool_use 后不主动关闭连接，客户端会一直等待 message_stop 而卡死。
+                                                    tracing::info!(
+                                                        message_id = %ctx.message_id,
+                                                        tool_use_id = %tool_use.tool_use_id,
+                                                        tool_name = %tool_use.name,
+                                                        "handlers.rs：should_finish=true（检测到 tool_use.stop=true）"
+                                                    );
+                                                    should_finish = true;
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -313,10 +321,20 @@ where
                             }
 
                             if should_finish {
+                                tracing::info!(
+                                    message_id = %ctx.message_id,
+                                    "handlers.rs：调用 StreamContext::generate_final_events（should_finish=true）"
+                                );
                                 events.extend(ctx.generate_final_events());
                             }
 
                             // 转换为 SSE 字节流
+                            if events.iter().any(|e| e.event == "message_stop") {
+                                tracing::info!(
+                                    message_id = %ctx.message_id,
+                                    "handlers.rs：本批输出包含 message_stop"
+                                );
+                            }
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -327,6 +345,10 @@ where
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             // 发送最终事件并结束
+                            tracing::info!(
+                                message_id = %ctx.message_id,
+                                "handlers.rs：调用 StreamContext::generate_final_events（读取响应流失败）"
+                            );
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
@@ -336,6 +358,10 @@ where
                         }
                         None => {
                             // 流结束，发送最终事件
+                            tracing::info!(
+                                message_id = %ctx.message_id,
+                                "handlers.rs：调用 StreamContext::generate_final_events（上游流结束）"
+                            );
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()

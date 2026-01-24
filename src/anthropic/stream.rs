@@ -317,6 +317,11 @@ impl SseStateManager {
             self.has_tool_use = true;
             for (block_index, block) in self.active_blocks.iter_mut() {
                 if block.block_type == "text" && block.started && !block.stopped {
+                    tracing::info!(
+                        index = *block_index,
+                        block_type = %block.block_type,
+                        "自动发送 content_block_stop（tool_use 开始前关闭 text 块）"
+                    );
                     // 自动发送 content_block_stop 关闭文本块
                     events.push(SseEvent::new(
                         "content_block_stop",
@@ -343,6 +348,11 @@ impl SseStateManager {
             self.active_blocks.insert(index, block);
         }
 
+        tracing::info!(
+            index,
+            block_type = %block_type,
+            "发送 content_block_start"
+        );
         events.push(SseEvent::new("content_block_start", data));
         events
     }
@@ -364,6 +374,34 @@ impl SseStateManager {
                 );
                 return None;
             }
+
+            let delta_type = data
+                .get("delta")
+                .and_then(|d| d.get("type"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("<unknown>");
+            let partial_len = data
+                .get("delta")
+                .and_then(|d| d.get("partial_json"))
+                .and_then(|p| p.as_str())
+                .map(|s| s.len());
+
+            if delta_type == "input_json_delta" {
+                tracing::info!(
+                    index,
+                    block_type = %block.block_type,
+                    delta_type,
+                    partial_len = partial_len.unwrap_or(0),
+                    "发送 content_block_delta"
+                );
+            } else {
+                tracing::trace!(
+                    index,
+                    block_type = %block.block_type,
+                    delta_type,
+                    "发送 content_block_delta"
+                );
+            }
         } else {
             // 块不存在，可能需要先创建
             tracing::warn!("收到未知块 {} 的 delta 事件", index);
@@ -381,6 +419,11 @@ impl SseStateManager {
                 return None;
             }
             block.stopped = true;
+            tracing::info!(
+                index,
+                block_type = %block.block_type,
+                "发送 content_block_stop"
+            );
             return Some(SseEvent::new(
                 "content_block_stop",
                 json!({
@@ -398,11 +441,28 @@ impl SseStateManager {
         input_tokens: i32,
         output_tokens: i32,
     ) -> Vec<SseEvent> {
+        tracing::info!(
+            message_started = self.message_started,
+            message_delta_sent = self.message_delta_sent,
+            message_ended = self.message_ended,
+            active_blocks = self.active_blocks.len(),
+            has_tool_use = self.has_tool_use,
+            stop_reason = %self.get_stop_reason(),
+            input_tokens,
+            output_tokens,
+            "SseStateManager::generate_final_events 被调用"
+        );
+
         let mut events = Vec::new();
 
         // 关闭所有未关闭的块
         for (index, block) in self.active_blocks.iter_mut() {
             if block.started && !block.stopped {
+                tracing::debug!(
+                    index = *index,
+                    block_type = %block.block_type,
+                    "generate_final_events：补发 content_block_stop（块未关闭）"
+                );
                 events.push(SseEvent::new(
                     "content_block_stop",
                     json!({
@@ -417,6 +477,12 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
+            tracing::info!(
+                stop_reason = %self.get_stop_reason(),
+                input_tokens,
+                output_tokens,
+                "发送 message_delta"
+            );
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
@@ -436,6 +502,7 @@ impl SseStateManager {
         // 发送 message_stop
         if !self.message_ended {
             self.message_ended = true;
+            tracing::info!("发送 message_stop");
             events.push(SseEvent::new(
                 "message_stop",
                 json!({ "type": "message_stop" }),
@@ -829,6 +896,20 @@ impl StreamContext {
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
+        let block_state = self
+            .state_manager
+            .active_blocks
+            .get(&block_index)
+            .map(|b| (b.block_type.clone(), b.started, b.stopped));
+
+        tracing::warn!(
+            message_id = %self.message_id,
+            block_index,
+            tool_name,
+            block_state = ?block_state,
+            "create_truncated_tool_error_events 被调用"
+        );
+
         // 构造错误 JSON 作为工具输入（避免拼接时破坏 JSON 转义）
         let error_input = serde_json::to_string(&json!({
             "error": "CONTENT_TOO_LARGE",
@@ -844,6 +925,14 @@ impl StreamContext {
                 tool_name, WRITE_TOOL_TOKEN_LIMIT
             )
         });
+
+        tracing::warn!(
+            message_id = %self.message_id,
+            block_index,
+            tool_name,
+            error_input_len = error_input.len(),
+            "准备发送截断工具错误 input_json_delta"
+        );
 
         if let Some(delta_event) = self.state_manager.handle_content_block_delta(
             block_index,
@@ -1080,6 +1169,18 @@ impl StreamContext {
 
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        tracing::info!(
+            message_id = %self.message_id,
+            model = %self.model,
+            thinking_enabled = self.thinking_enabled,
+            in_thinking_block = self.in_thinking_block,
+            thinking_extracted = self.thinking_extracted,
+            thinking_buffer_len = self.thinking_buffer.len(),
+            tool_buffers = self.tool_input_buffers.len(),
+            active_blocks = self.state_manager.active_blocks.len(),
+            "StreamContext::generate_final_events 被调用"
+        );
+
         let mut events = Vec::new();
 
         // 检查未完成的 Write 工具调用（可能被截断导致 stop=true 从未到达）
