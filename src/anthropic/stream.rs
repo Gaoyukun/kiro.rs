@@ -910,46 +910,49 @@ impl StreamContext {
             "create_truncated_tool_error_events 被调用"
         );
 
-        // 构造错误 JSON 作为工具输入（避免拼接时破坏 JSON 转义）
-        let error_input = serde_json::to_string(&json!({
-            "error": "CONTENT_TOO_LARGE",
-            "message": format!(
-                "{}工具调用失败：不允许一次性写入超过{}个token，请分批写入",
-                tool_name, WRITE_TOOL_TOKEN_LIMIT
-            )
-        }))
-        .unwrap_or_else(|_| {
-            // 极端情况下序列化失败，退化为一个最小、可解析的 JSON
-            format!(
-                r#"{{"error":"CONTENT_TOO_LARGE","message":"{}工具调用失败：不允许一次性写入超过{}个token，请分批写入"}}"#,
-                tool_name, WRITE_TOOL_TOKEN_LIMIT
-            )
-        });
+        // 关键：不要再发送任何 input_json_delta（否则客户端会把它当作工具调用去执行）。
+        // 这里将 tool_use 块收尾，然后输出一个普通 text 块作为“系统提示”，并以 end_turn 结束消息。
+        self.state_manager.set_stop_reason("end_turn");
 
-        tracing::warn!(
-            message_id = %self.message_id,
-            block_index,
-            tool_name,
-            error_input_len = error_input.len(),
-            "准备发送截断工具错误 input_json_delta"
+        // 关闭工具块
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
+            events.push(stop_event);
+        }
+
+        // 创建新的 text 块并立即关闭，避免残留未关闭的块状态影响 message_delta
+        let text_index = self.state_manager.next_block_index();
+        events.extend(self.state_manager.handle_content_block_start(
+            text_index,
+            "text",
+            json!({
+                "type": "content_block_start",
+                "index": text_index,
+                "content_block": {
+                    "type": "text",
+                    "text": ""
+                }
+            }),
+        ));
+
+        let text = format!(
+            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。",
+            WRITE_TOOL_TOKEN_LIMIT, WRITE_TOOL_TOKEN_LIMIT
         );
-
         if let Some(delta_event) = self.state_manager.handle_content_block_delta(
-            block_index,
+            text_index,
             json!({
                 "type": "content_block_delta",
-                "index": block_index,
+                "index": text_index,
                 "delta": {
-                    "type": "input_json_delta",
-                    "partial_json": error_input
+                    "type": "text_delta",
+                    "text": text
                 }
             }),
         ) {
             events.push(delta_event);
         }
 
-        // 关闭工具块
-        if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(text_index) {
             events.push(stop_event);
         }
 
@@ -1644,20 +1647,47 @@ mod tests {
 
         let input_deltas: Vec<&SseEvent> = events
             .iter()
-            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta")
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+            })
             .collect();
-        assert_eq!(input_deltas.len(), 1, "should emit exactly one input_json_delta");
+        assert_eq!(
+            input_deltas.len(),
+            0,
+            "truncated Write tool call must not emit input_json_delta"
+        );
 
-        let partial = input_deltas[0].data["delta"]["partial_json"]
-            .as_str()
-            .expect("partial_json should be a string");
-        assert!(
-            partial.contains(r#""error":"CONTENT_TOO_LARGE""#),
-            "should replace truncated Write tool input with error JSON"
+        let expected_text = format!(
+            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。",
+            WRITE_TOOL_TOKEN_LIMIT, WRITE_TOOL_TOKEN_LIMIT
         );
         assert!(
-            !partial.contains(r#""content":"abc""#),
-            "error JSON must not contain original truncated content"
+            events.iter().any(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "text_delta"
+                    && e.data["delta"]["text"] == expected_text
+            }),
+            "should emit a text_delta with the truncation system prompt"
+        );
+
+        let text_start_index = events.iter().find_map(|e| {
+            if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
+                e.data["index"].as_i64()
+            } else {
+                None
+            }
+        });
+        assert!(
+            text_start_index.is_some(),
+            "should start a new text block for the truncation message"
+        );
+        let text_start_index = text_start_index.unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e.event == "content_block_stop"
+                    && e.data["index"].as_i64() == Some(text_start_index)
+            }),
+            "should stop the truncation text block"
         );
 
         let block_index = *ctx
@@ -1670,6 +1700,12 @@ mod tests {
                     && e.data["index"].as_i64() == Some(block_index as i64)
             }),
             "should stop the tool_use block"
+        );
+
+        assert_eq!(
+            ctx.state_manager.get_stop_reason(),
+            "end_turn",
+            "stop_reason must be end_turn after truncation"
         );
     }
 
@@ -1692,16 +1728,37 @@ mod tests {
         let final_events = ctx.generate_final_events();
         let input_deltas: Vec<&SseEvent> = final_events
             .iter()
-            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta")
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+            })
             .collect();
-        assert_eq!(input_deltas.len(), 1, "should emit one error input_json_delta on final flush");
+        assert_eq!(
+            input_deltas.len(),
+            0,
+            "truncated Write tool call must not emit input_json_delta on final flush"
+        );
 
-        let partial = input_deltas[0].data["delta"]["partial_json"]
-            .as_str()
-            .expect("partial_json should be a string");
+        let expected_text = format!(
+            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。",
+            WRITE_TOOL_TOKEN_LIMIT, WRITE_TOOL_TOKEN_LIMIT
+        );
         assert!(
-            partial.contains(r#""error":"CONTENT_TOO_LARGE""#),
-            "should replace incomplete Write tool input with error JSON at stream end"
+            final_events.iter().any(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "text_delta"
+                    && e.data["delta"]["text"] == expected_text
+            }),
+            "should emit a text_delta with the truncation system prompt at stream end"
+        );
+
+        let message_delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should contain message_delta");
+        assert_eq!(
+            message_delta.data["delta"]["stop_reason"],
+            "end_turn",
+            "stop_reason must be end_turn after truncation"
         );
     }
 
@@ -1727,20 +1784,33 @@ mod tests {
 
         let input_deltas: Vec<&SseEvent> = events
             .iter()
-            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta")
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+            })
             .collect();
-        assert_eq!(input_deltas.len(), 1, "should emit exactly one input_json_delta");
+        assert_eq!(
+            input_deltas.len(),
+            0,
+            "truncated Write tool call must not emit input_json_delta"
+        );
 
-        let partial = input_deltas[0].data["delta"]["partial_json"]
-            .as_str()
-            .expect("partial_json should be a string");
-        assert!(
-            partial.contains("不允许一次性写入超过"),
-            "error message should mention token limit"
+        let expected_text = format!(
+            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。",
+            WRITE_TOOL_TOKEN_LIMIT, WRITE_TOOL_TOKEN_LIMIT
         );
         assert!(
-            partial.contains(&WRITE_TOOL_TOKEN_LIMIT.to_string()),
-            "error message should include the token limit value"
+            events.iter().any(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "text_delta"
+                    && e.data["delta"]["text"] == expected_text
+            }),
+            "should emit a text_delta with the truncation system prompt"
+        );
+
+        assert_eq!(
+            ctx.state_manager.get_stop_reason(),
+            "end_turn",
+            "stop_reason must be end_turn after truncation"
         );
     }
 
