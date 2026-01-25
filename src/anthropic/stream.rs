@@ -279,7 +279,13 @@ impl SseStateManager {
 
     /// 设置 stop_reason
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
-        self.stop_reason = Some(reason.into());
+        let reason_str = reason.into();
+        if reason_str == "max_tokens" {
+            tracing::warn!(
+                "stop_reason=max_tokens 被触发，可能存在输出截断"
+            );
+        }
+        self.stop_reason = Some(reason_str);
     }
 
     /// 获取最终的 stop_reason
@@ -898,22 +904,22 @@ impl StreamContext {
             "create_truncated_tool_error_events 被调用"
         );
 
-        // 关键：为了让 client 继续（而不是收到 end_turn 直接停止），这里输出"系统提示"文本，
+        // 关键：为了让 client 继续（而不是收到 end_turn 直接停止），这里输出"系统提示"到 thinking，
         // 并追加一个占位 tool_use（Read + 占位路径），最终 stop_reason 设为 tool_use。
         self.state_manager.set_has_tool_use(true);
         self.state_manager.set_stop_reason("tool_use");
 
-        // 创建新的 text 块并立即关闭，避免残留未关闭的块状态影响 message_delta
-        let text_index = self.state_manager.next_block_index();
+        // 创建新的 thinking 块并立即关闭，避免残留未关闭的块状态影响 message_delta
+        let thinking_index = self.state_manager.next_block_index();
         events.extend(self.state_manager.handle_content_block_start(
-            text_index,
-            "text",
+            thinking_index,
+            "thinking",
             json!({
                 "type": "content_block_start",
-                "index": text_index,
+                "index": thinking_index,
                 "content_block": {
-                    "type": "text",
-                    "text": ""
+                    "type": "thinking",
+                    "thinking": ""
                 }
             }),
         ));
@@ -925,20 +931,20 @@ impl StreamContext {
             WRITE_TOOL_TRUNCATED_ERROR
         };
         if let Some(delta_event) = self.state_manager.handle_content_block_delta(
-            text_index,
+            thinking_index,
             json!({
                 "type": "content_block_delta",
-                "index": text_index,
+                "index": thinking_index,
                 "delta": {
-                    "type": "text_delta",
-                    "text": text
+                    "type": "thinking_delta",
+                    "thinking": text
                 }
             }),
         ) {
             events.push(delta_event);
         }
 
-        if let Some(stop_event) = self.state_manager.handle_content_block_stop(text_index) {
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
             events.push(stop_event);
         }
 
@@ -1777,30 +1783,30 @@ mod tests {
         assert!(
             events.iter().any(|e| {
                 e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == WRITE_TOOL_TRUNCATED_ERROR
+                    && e.data["delta"]["type"] == "thinking_delta"
+                    && e.data["delta"]["thinking"] == WRITE_TOOL_TRUNCATED_ERROR
             }),
-            "should emit a text_delta with the truncation system prompt"
+            "should emit a thinking_delta with the truncation system prompt"
         );
 
-        let text_start_index = events.iter().find_map(|e| {
-            if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
+        let thinking_start_index = events.iter().find_map(|e| {
+            if e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking" {
                 e.data["index"].as_i64()
             } else {
                 None
             }
         });
         assert!(
-            text_start_index.is_some(),
-            "should start a new text block for the truncation message"
+            thinking_start_index.is_some(),
+            "should start a new thinking block for the truncation message"
         );
-        let text_start_index = text_start_index.unwrap();
+        let thinking_start_index = thinking_start_index.unwrap();
         assert!(
             events.iter().any(|e| {
                 e.event == "content_block_stop"
-                    && e.data["index"].as_i64() == Some(text_start_index)
+                    && e.data["index"].as_i64() == Some(thinking_start_index)
             }),
-            "should stop the truncation text block"
+            "should stop the truncation thinking block"
         );
 
         assert!(
@@ -1883,48 +1889,48 @@ mod tests {
         assert!(
             final_events.iter().any(|e| {
                 e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == WRITE_TOOL_TRUNCATED_ERROR
+                    && e.data["delta"]["type"] == "thinking_delta"
+                    && e.data["delta"]["thinking"] == WRITE_TOOL_TRUNCATED_ERROR
             }),
-            "should emit a text_delta with the truncation system prompt at stream end"
+            "should emit a thinking_delta with the truncation system prompt at stream end"
         );
 
-        // Ensure event order: text block -> tool_use -> message_delta(tool_use) -> message_stop
-        let text_delta_pos = final_events.iter().position(|e| {
+        // Ensure event order: thinking block -> tool_use -> message_delta(tool_use) -> message_stop
+        let thinking_delta_pos = final_events.iter().position(|e| {
             e.event == "content_block_delta"
-                && e.data["delta"]["type"] == "text_delta"
-                && e.data["delta"]["text"] == expected_text
+                && e.data["delta"]["type"] == "thinking_delta"
+                && e.data["delta"]["thinking"] == WRITE_TOOL_TRUNCATED_ERROR
         });
         assert!(
-            text_delta_pos.is_some(),
-            "should contain truncation text_delta"
+            thinking_delta_pos.is_some(),
+            "should contain truncation thinking_delta"
         );
-        let text_delta_pos = text_delta_pos.unwrap();
+        let thinking_delta_pos = thinking_delta_pos.unwrap();
 
-        let text_start_pos = final_events.iter().take(text_delta_pos).position(|e| {
-            e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+        let thinking_start_pos = final_events.iter().take(thinking_delta_pos).position(|e| {
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
         });
         assert!(
-            text_start_pos.is_some(),
-            "text_delta should be preceded by a text content_block_start"
+            thinking_start_pos.is_some(),
+            "thinking_delta should be preceded by a thinking content_block_start"
         );
-        let text_start_pos = text_start_pos.unwrap();
+        let thinking_start_pos = thinking_start_pos.unwrap();
 
-        let text_index = final_events[text_start_pos]
+        let thinking_index = final_events[thinking_start_pos]
             .data["index"]
             .as_i64()
-            .expect("text start must have index");
-        let text_stop_pos = final_events.iter().position(|e| {
-            e.event == "content_block_stop" && e.data["index"].as_i64() == Some(text_index)
+            .expect("thinking start must have index");
+        let thinking_stop_pos = final_events.iter().position(|e| {
+            e.event == "content_block_stop" && e.data["index"].as_i64() == Some(thinking_index)
         });
         assert!(
-            text_stop_pos.is_some(),
-            "text block should be stopped"
+            thinking_stop_pos.is_some(),
+            "thinking block should be stopped"
         );
-        let text_stop_pos = text_stop_pos.unwrap();
+        let thinking_stop_pos = thinking_stop_pos.unwrap();
         assert!(
-            text_start_pos < text_delta_pos && text_delta_pos < text_stop_pos,
-            "text block events should be start -> delta -> stop"
+            thinking_start_pos < thinking_delta_pos && thinking_delta_pos < thinking_stop_pos,
+            "thinking block events should be start -> delta -> stop"
         );
 
         let tool_start_pos = final_events.iter().position(|e| {
@@ -1977,7 +1983,7 @@ mod tests {
             .position(|e| e.event == "message_stop")
             .expect("should contain message_stop");
         assert!(
-            text_stop_pos < tool_start_pos
+            thinking_stop_pos < tool_start_pos
                 && tool_stop_pos < message_delta_pos
                 && message_delta_pos < message_stop_pos,
             "final event order should be text -> tool_use -> message_delta -> message_stop"
@@ -2059,10 +2065,10 @@ mod tests {
         assert!(
             events.iter().any(|e| {
                 e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == WRITE_TOOL_TRUNCATED_ERROR
+                    && e.data["delta"]["type"] == "thinking_delta"
+                    && e.data["delta"]["thinking"] == WRITE_TOOL_TRUNCATED_ERROR
             }),
-            "should emit a text_delta with the truncation system prompt"
+            "should emit a thinking_delta with the truncation system prompt"
         );
 
         assert_eq!(
