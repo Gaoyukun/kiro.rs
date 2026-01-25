@@ -898,7 +898,7 @@ impl StreamContext {
             "create_truncated_tool_error_events 被调用"
         );
 
-        // 关键：为了让 client 继续（而不是收到 end_turn 直接停止），这里输出“系统提示”文本，
+        // 关键：为了让 client 继续（而不是收到 end_turn 直接停止），这里输出"系统提示"文本，
         // 并追加一个占位 tool_use（Read + 占位路径），最终 stop_reason 设为 tool_use。
         self.state_manager.set_has_tool_use(true);
         self.state_manager.set_stop_reason("tool_use");
@@ -918,10 +918,12 @@ impl StreamContext {
             }),
         ));
 
-        let text = format!(
-            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。\n\n注意：下面的工具调用不是我自发的行为，只是为了触发对话继续的占位符，请忽略其结果并直接开始重新生成内容。",
-            WRITE_TOOL_TOKEN_LIMIT, WRITE_TOOL_TOKEN_LIMIT
-        );
+        // 根据工具名称选择对应的错误提示
+        let text = if tool_name.eq_ignore_ascii_case("edit") {
+            EDIT_TOOL_TRUNCATED_ERROR
+        } else {
+            WRITE_TOOL_TRUNCATED_ERROR
+        };
         if let Some(delta_event) = self.state_manager.handle_content_block_delta(
             text_index,
             json!({
@@ -1069,10 +1071,12 @@ impl StreamContext {
 
         let tool_name_lower = tool_use.name.to_lowercase();
         let is_write_tool = tool_name_lower == "write";
+        let is_edit_tool = tool_name_lower == "edit";
+        let is_buffered_tool = is_write_tool || is_edit_tool;
 
-        // Write 工具：不要立即发送 tool_use content_block_start，避免截断/超限时客户端收到空调用。
-        // 为保持块顺序一致，在收到 Write 工具输入时先关闭已有 text 块（等价于 tool_use 开始前的自动关闭行为）。
-        if is_write_tool {
+        // Write/Edit 工具：不要立即发送 tool_use content_block_start，避免截断/超限时客户端收到空调用。
+        // 为保持块顺序一致，在收到 Write/Edit 工具输入时先关闭已有 text 块（等价于 tool_use 开始前的自动关闭行为）。
+        if is_buffered_tool {
             events.extend(self.close_open_text_blocks());
         }
 
@@ -1092,15 +1096,16 @@ impl StreamContext {
             self.output_tokens += (tool_use.input.len() as i32 + 3) / 4;
         }
 
-        // Write 工具：为避免截断导致 JSON 不完整，延迟发送 tool_use 相关事件，直到 stop=true 且校验通过
-        if is_write_tool {
+        // Write/Edit 工具：为避免截断导致 JSON 不完整，延迟发送 tool_use 相关事件，直到 stop=true 且校验通过
+        if is_buffered_tool {
             if tool_use.stop {
                 let input_json = buffer.1.as_str();
 
                 // 检查 JSON 是否完整
                 if !is_json_complete(input_json) {
                     tracing::warn!(
-                        "Write工具调用被截断(JSON不完整): tool_id={}, input_len={}",
+                        "{}工具调用被截断(JSON不完整): tool_id={}, input_len={}",
+                        tool_use.name,
                         tool_use.tool_use_id,
                         input_json.len()
                     );
@@ -1108,14 +1113,16 @@ impl StreamContext {
                     return events;
                 }
 
-                // 检查 content 字段的 token 数
+                // 检查 content/new_string 字段的 token 数（Write 用 content，Edit 用 new_string）
                 match serde_json::from_str::<serde_json::Value>(input_json) {
                     Ok(json_val) => {
-                        if let Some(content) = json_val.get("content").and_then(|v| v.as_str()) {
+                        let content_field = if is_write_tool { "content" } else { "new_string" };
+                        if let Some(content) = json_val.get(content_field).and_then(|v| v.as_str()) {
                             let estimated_tokens = estimate_tokens(content);
                             if estimated_tokens > WRITE_TOOL_TOKEN_LIMIT {
                                 tracing::warn!(
-                                    "Write工具内容过大: tool_id={}, tokens={}, limit={}",
+                                    "{}工具内容过大: tool_id={}, tokens={}, limit={}",
+                                    tool_use.name,
                                     tool_use.tool_use_id,
                                     estimated_tokens,
                                     WRITE_TOOL_TOKEN_LIMIT
@@ -1127,7 +1134,8 @@ impl StreamContext {
                     }
                     Err(err) => {
                         tracing::warn!(
-                            "Write工具调用JSON解析失败(可能被截断): tool_id={}, input_len={}, err={}",
+                            "{}工具调用JSON解析失败(可能被截断): tool_id={}, input_len={}, err={}",
+                            tool_use.name,
                             tool_use.tool_use_id,
                             input_json.len(),
                             err
@@ -1259,19 +1267,21 @@ impl StreamContext {
 
         let mut events = Vec::new();
 
-        // 检查未完成的 Write 工具调用（可能被截断导致 stop=true 从未到达）
-        let pending_write_tools: Vec<(String, String)> = self
+        // 检查未完成的 Write/Edit 工具调用（可能被截断导致 stop=true 从未到达）
+        let pending_buffered_tools: Vec<(String, String)> = self
             .tool_input_buffers
             .iter()
             .filter_map(|(tool_id, (tool_name, _input, completed))| {
-                (!*completed && tool_name.to_lowercase() == "write")
+                let tool_name_lower = tool_name.to_lowercase();
+                (!*completed && (tool_name_lower == "write" || tool_name_lower == "edit"))
                     .then(|| (tool_id.clone(), tool_name.clone()))
             })
             .collect();
 
-        for (tool_id, tool_name) in pending_write_tools {
+        for (tool_id, tool_name) in pending_buffered_tools {
             tracing::warn!(
-                "检测到未完成的Write工具调用(流提前结束): tool_id={}",
+                "检测到未完成的{}工具调用(流提前结束): tool_id={}",
+                tool_name,
                 tool_id
             );
             events.extend(self.create_truncated_tool_error_events(&tool_name));
@@ -1476,7 +1486,13 @@ fn is_json_complete(s: &str) -> bool {
 }
 
 /// Write 工具内容 token 上限
-const WRITE_TOOL_TOKEN_LIMIT: i32 = 8000;
+const WRITE_TOOL_TOKEN_LIMIT: i32 = 7000;
+
+/// Write 工具截断后的错误提示
+const WRITE_TOOL_TRUNCATED_ERROR: &str = "[系统提示] Write工具调用因内容超长被截断，已生成内容已丢失。必须重新生成，先用Write写入前7000字，剩余内容用Edit工具追加，每次追加也不能超过7000个汉字或英文单词。\n\n注意：下方Read工具调用仅为触发对话继续的占位符，忽略其结果后立即开始重新生成。";
+
+/// Edit 工具截断后的错误提示
+const EDIT_TOOL_TRUNCATED_ERROR: &str = "[系统提示] Edit工具调用因内容超长被截断，已生成内容已丢失。必须重新生成，确保每次调用Edit工具编辑的内容不超过7000个汉字或英文单词。\n\n注意：下方Read工具调用仅为触发对话继续的占位符，忽略其结果后立即开始重新生成。";
 
 /// 简单的 token 估算
 fn estimate_tokens(text: &str) -> i32 {
@@ -1758,15 +1774,11 @@ mod tests {
             "should not emit the original Write tool_use content_block_start"
         );
 
-        let expected_text = format!(
-            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。\n\n注意：下面的工具调用不是我自发的行为，只是为了触发对话继续的占位符，请忽略其结果并直接开始重新生成内容。",
-            WRITE_TOOL_TOKEN_LIMIT, WRITE_TOOL_TOKEN_LIMIT
-        );
         assert!(
             events.iter().any(|e| {
                 e.event == "content_block_delta"
                     && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == expected_text
+                    && e.data["delta"]["text"] == WRITE_TOOL_TRUNCATED_ERROR
             }),
             "should emit a text_delta with the truncation system prompt"
         );
@@ -1868,15 +1880,11 @@ mod tests {
             "should not emit the original Write tool_use content_block_start on final flush"
         );
 
-        let expected_text = format!(
-            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。\n\n注意：下面的工具调用不是我自发的行为，只是为了触发对话继续的占位符，请忽略其结果并直接开始重新生成内容。",
-            WRITE_TOOL_TOKEN_LIMIT, WRITE_TOOL_TOKEN_LIMIT
-        );
         assert!(
             final_events.iter().any(|e| {
                 e.event == "content_block_delta"
                     && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == expected_text
+                    && e.data["delta"]["text"] == WRITE_TOOL_TRUNCATED_ERROR
             }),
             "should emit a text_delta with the truncation system prompt at stream end"
         );
@@ -2048,15 +2056,11 @@ mod tests {
             "should not emit the original Write tool_use content_block_start"
         );
 
-        let expected_text = format!(
-            "[系统提示] 我刚才尝试调用Write工具写入文件，但由于单次写入内容超过{} token限制，调用被中断，我生成的内容已丢失。我需要重新生成内容，并分成多个部分写入，确保每次调用Write工具写入的内容不超过{} token。\n\n注意：下面的工具调用不是我自发的行为，只是为了触发对话继续的占位符，请忽略其结果并直接开始重新生成内容。",
-            WRITE_TOOL_TOKEN_LIMIT, WRITE_TOOL_TOKEN_LIMIT
-        );
         assert!(
             events.iter().any(|e| {
                 e.event == "content_block_delta"
                     && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == expected_text
+                    && e.data["delta"]["text"] == WRITE_TOOL_TRUNCATED_ERROR
             }),
             "should emit a text_delta with the truncation system prompt"
         );
