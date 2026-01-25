@@ -733,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_tools_preserves_description() {
+    fn test_convert_tools_preserves_write_description() {
         use super::super::types::Tool as AnthropicTool;
 
         let tools = Some(vec![AnthropicTool {
@@ -749,6 +749,26 @@ mod tests {
         assert_eq!(
             converted[0].tool_specification.description,
             "Write a file"
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_preserves_edit_description() {
+        use super::super::types::Tool as AnthropicTool;
+
+        let tools = Some(vec![AnthropicTool {
+            tool_type: None,
+            name: "Edit".to_string(),
+            description: "Edit a file".to_string(),
+            input_schema: std::collections::HashMap::new(),
+            max_uses: None,
+        }]);
+
+        let converted = convert_tools(&tools);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(
+            converted[0].tool_specification.description,
+            "Edit a file"
         );
     }
 
