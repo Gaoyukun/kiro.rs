@@ -1492,10 +1492,10 @@ fn is_json_complete(s: &str) -> bool {
 const WRITE_TOOL_TOKEN_LIMIT: i32 = 7000;
 
 /// Write 工具截断后的错误提示
-const WRITE_TOOL_TRUNCATED_ERROR: &str = "[系统提示] Write工具调用因内容超长被截断，已生成内容已丢失。必须重新生成，先用Write写入前7000字，剩余内容用Edit工具追加，每次追加也不能超过7000个汉字或英文单词。\n\n注意：下方Read工具调用仅为触发对话继续的占位符，忽略其结果后立即开始重新生成。";
+const WRITE_TOOL_TRUNCATED_ERROR: &str = "我需要遵守工具描述中的长度限制调用 Write 工具。";
 
 /// Edit 工具截断后的错误提示
-const EDIT_TOOL_TRUNCATED_ERROR: &str = "[系统提示] Edit工具调用因内容超长被截断，已生成内容已丢失。必须重新生成，确保每次调用Edit工具编辑的内容不超过7000个汉字或英文单词。\n\n注意：下方Read工具调用仅为触发对话继续的占位符，忽略其结果后立即开始重新生成。";
+const EDIT_TOOL_TRUNCATED_ERROR: &str = "我需要遵守工具描述中的长度限制调用 Edit 工具。";
 
 /// 简单的 token 估算
 fn estimate_tokens(text: &str) -> i32 {
