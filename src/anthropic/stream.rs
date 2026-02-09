@@ -472,6 +472,8 @@ pub struct StreamContext {
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
+    /// 工具输入缓冲区 (tool_id -> (tool_name, accumulated_input, is_completed))
+    pub tool_input_buffers: HashMap<String, (String, String, bool)>,
     /// thinking 是否启用
     pub thinking_enabled: bool,
     /// thinking 内容缓冲区
@@ -504,6 +506,7 @@ impl StreamContext {
             context_input_tokens: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
+            tool_input_buffers: HashMap::new(),
             thinking_enabled,
             thinking_buffer: String::new(),
             in_thinking_block: false,
@@ -859,6 +862,117 @@ impl StreamContext {
         )
     }
 
+    /// 创建截断工具的错误事件（替换原有工具调用）
+    fn create_truncated_tool_error_events(&mut self, tool_name: &str) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+
+        // 关键：输出系统提示到 text，并追加一个占位 tool_use，
+        // 让客户端在 stop_reason=tool_use 下继续发起下一轮。
+        self.state_manager.set_has_tool_use(true);
+        self.state_manager.set_stop_reason("tool_use");
+
+        // 创建新的 text 块并立即关闭，避免影响后续 message_delta
+        let text_index = self.state_manager.next_block_index();
+        events.extend(self.state_manager.handle_content_block_start(
+            text_index,
+            "text",
+            json!({
+                "type": "content_block_start",
+                "index": text_index,
+                "content_block": {
+                    "type": "text",
+                    "text": ""
+                }
+            }),
+        ));
+
+        let text = if tool_name.eq_ignore_ascii_case("edit") {
+            EDIT_TOOL_TRUNCATED_ERROR
+        } else {
+            WRITE_TOOL_TRUNCATED_ERROR
+        };
+        if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+            text_index,
+            json!({
+                "type": "content_block_delta",
+                "index": text_index,
+                "delta": {
+                    "type": "text_delta",
+                    "text": text
+                }
+            }),
+        ) {
+            events.push(delta_event);
+        }
+
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(text_index) {
+            events.push(stop_event);
+        }
+
+        // 占位 tool_use：用于触发 client 继续发起下一轮（忽略其结果）
+        let tool_use_id = Uuid::new_v4().to_string();
+        let tool_index = self.state_manager.next_block_index();
+        events.extend(self.state_manager.handle_content_block_start(
+            tool_index,
+            "tool_use",
+            json!({
+                "type": "content_block_start",
+                "index": tool_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": "Read",
+                    "input": {}
+                }
+            }),
+        ));
+
+        let placeholder_input = r#"{"file_path": "/__placeholder_to_trigger_continue__"}"#;
+        if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+            tool_index,
+            json!({
+                "type": "content_block_delta",
+                "index": tool_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": placeholder_input
+                }
+            }),
+        ) {
+            events.push(delta_event);
+        }
+
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(tool_index) {
+            events.push(stop_event);
+        }
+
+        events
+    }
+
+    /// 关闭所有打开的 text 块（用于延迟发送 Write/Edit 工具调用时保持块顺序一致）
+    fn close_open_text_blocks(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+
+        let open_text_indices: Vec<i32> = self
+            .state_manager
+            .active_blocks
+            .iter()
+            .filter_map(|(index, block)| {
+                (block.block_type == "text" && block.started && !block.stopped).then_some(*index)
+            })
+            .collect();
+
+        for index in open_text_indices {
+            if let Some(stop_event) = self.state_manager.handle_content_block_stop(index) {
+                events.push(stop_event);
+            }
+        }
+
+        self.text_block_index = None;
+
+        events
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -920,6 +1034,121 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(&buffered));
         }
 
+        let tool_name_lower = tool_use.name.to_lowercase();
+        let is_write_tool = tool_name_lower == "write";
+        let is_edit_tool = tool_name_lower == "edit";
+        let is_buffered_tool = is_write_tool || is_edit_tool;
+
+        // Write/Edit 工具：不要立即发送 tool_use content_block_start，避免截断/超限时客户端收到空调用。
+        // 为保持块顺序一致，在收到 Write/Edit 工具输入时先关闭已有 text 块。
+        if is_buffered_tool {
+            events.extend(self.close_open_text_blocks());
+        }
+
+        // 累积工具输入到缓冲区
+        let buffer = self
+            .tool_input_buffers
+            .entry(tool_use.tool_use_id.clone())
+            .or_insert_with(|| (tool_use.name.clone(), String::new(), false));
+        buffer.1.push_str(&tool_use.input);
+
+        if tool_use.stop {
+            buffer.2 = true;
+        }
+
+        // 估算 token（与是否发送 delta 无关）
+        if !tool_use.input.is_empty() {
+            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4;
+        }
+
+        // Write/Edit 工具：延迟发送 tool_use 相关事件，直到 stop=true 且校验通过
+        if is_buffered_tool {
+            if tool_use.stop {
+                let input_json = buffer.1.as_str();
+
+                // 检查 JSON 是否完整
+                if !is_json_complete(input_json) {
+                    events.extend(self.create_truncated_tool_error_events(&tool_use.name));
+                    return events;
+                }
+
+                // 检查 content/new_string 字段的 token 数（Write 用 content，Edit 用 new_string）
+                match serde_json::from_str::<serde_json::Value>(input_json) {
+                    Ok(json_val) => {
+                        let content_field = if is_write_tool {
+                            "content"
+                        } else {
+                            "new_string"
+                        };
+                        if let Some(content) = json_val.get(content_field).and_then(|v| v.as_str())
+                        {
+                            let estimated_tokens = estimate_tokens(content);
+                            if estimated_tokens > WRITE_TOOL_TOKEN_LIMIT {
+                                events.extend(
+                                    self.create_truncated_tool_error_events(&tool_use.name),
+                                );
+                                return events;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        events.extend(self.create_truncated_tool_error_events(&tool_use.name));
+                        return events;
+                    }
+                }
+
+                // 校验通过：一次性发送 content_block_start + 完整 input_json_delta + content_block_stop
+                let block_index =
+                    if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
+                        idx
+                    } else {
+                        let idx = self.state_manager.next_block_index();
+                        self.tool_block_indices
+                            .insert(tool_use.tool_use_id.clone(), idx);
+                        idx
+                    };
+
+                let start_events = self.state_manager.handle_content_block_start(
+                    block_index,
+                    "tool_use",
+                    json!({
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tool_use.tool_use_id,
+                            "name": tool_use.name,
+                            "input": {}
+                        }
+                    }),
+                );
+                events.extend(start_events);
+
+                if !input_json.is_empty() {
+                    if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+                        block_index,
+                        json!({
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": input_json
+                            }
+                        }),
+                    ) {
+                        events.push(delta_event);
+                    }
+                }
+
+                if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index)
+                {
+                    events.push(stop_event);
+                }
+            }
+
+            return events;
+        }
+
         // 获取或分配块索引
         let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
             idx
@@ -949,8 +1178,6 @@ impl StreamContext {
 
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
         if !tool_use.input.is_empty() {
-            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
-
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
                 json!({
@@ -979,6 +1206,21 @@ impl StreamContext {
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // 检查未完成的 Write/Edit 工具调用（可能被截断导致 stop=true 从未到达）
+        let pending_buffered_tools: Vec<(String, String)> = self
+            .tool_input_buffers
+            .iter()
+            .filter_map(|(tool_id, (tool_name, _input, completed))| {
+                let tool_name_lower = tool_name.to_lowercase();
+                (!*completed && (tool_name_lower == "write" || tool_name_lower == "edit"))
+                    .then(|| (tool_id.clone(), tool_name.clone()))
+            })
+            .collect();
+
+        for (_tool_id, tool_name) in pending_buffered_tools {
+            events.extend(self.create_truncated_tool_error_events(&tool_name));
+        }
 
         // Flush thinking_buffer 中的剩余内容
         if self.thinking_enabled && !self.thinking_buffer.is_empty() {
@@ -1158,6 +1400,51 @@ impl BufferedStreamContext {
     }
 }
 
+/// 检查 JSON 字符串是否完整（括号平衡）
+fn is_json_complete(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+
+    let mut brace_count = 0i32;
+    let mut bracket_count = 0i32;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for c in s.chars() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+
+        match c {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => brace_count += 1,
+            '}' if !in_string => brace_count -= 1,
+            '[' if !in_string => bracket_count += 1,
+            ']' if !in_string => bracket_count -= 1,
+            _ => {}
+        }
+
+        if brace_count < 0 || bracket_count < 0 {
+            return false;
+        }
+    }
+
+    brace_count == 0 && bracket_count == 0 && !in_string
+}
+
+/// Write/Edit 工具内容 token 上限
+const WRITE_TOOL_TOKEN_LIMIT: i32 = 7000;
+
+/// Write 工具截断后的错误提示
+const WRITE_TOOL_TRUNCATED_ERROR: &str = "我需要遵守工具描述中的长度限制调用 Write 工具。";
+
+/// Edit 工具截断后的错误提示
+const EDIT_TOOL_TRUNCATED_ERROR: &str = "我需要遵守工具描述中的长度限制调用 Edit 工具。";
+
 /// 简单的 token 估算
 fn estimate_tokens(text: &str) -> i32 {
     let chars: Vec<char> = text.chars().collect();
@@ -1307,7 +1594,7 @@ mod tests {
         );
 
         let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-            name: "Write".to_string(),
+            name: "test_tool".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
             stop: false,
@@ -1370,6 +1657,433 @@ mod tests {
         assert!(estimate_tokens("Hello") > 0);
         assert!(estimate_tokens("你好") > 0);
         assert!(estimate_tokens("Hello 你好") > 0);
+    }
+
+    #[test]
+    fn test_is_json_complete_basic() {
+        assert!(is_json_complete(r#"{"a":1}"#));
+        assert!(is_json_complete(r#"[{"a":"b"}]"#));
+        assert!(is_json_complete(r#"{"a":"b\\\"c"}"#));
+
+        assert!(!is_json_complete(r#"{"a":1"#));
+        assert!(!is_json_complete(r#"{"a":"unterminated}"#));
+        assert!(!is_json_complete(""));
+        assert!(!is_json_complete("   "));
+    }
+
+    #[test]
+    fn test_write_tool_incomplete_json_on_stop_is_replaced_with_error() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false);
+        let _initial_events = ctx.generate_initial_events();
+
+        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: r#"{"path":"a","content":"abc""#.to_string(),
+            stop: true,
+        });
+
+        let input_deltas: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+            })
+            .collect();
+        assert_eq!(
+            input_deltas.len(),
+            1,
+            "should emit one placeholder input_json_delta to trigger client continuation"
+        );
+        assert_eq!(
+            input_deltas[0].data["delta"]["partial_json"].as_str(),
+            Some(r#"{"file_path": "/__placeholder_to_trigger_continue__"}"#),
+            "placeholder input_json_delta should contain the placeholder Read input"
+        );
+
+        let tool_use_starts: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .collect();
+        assert_eq!(
+            tool_use_starts.len(),
+            1,
+            "should emit one placeholder tool_use content_block_start"
+        );
+        assert_eq!(
+            tool_use_starts[0].data["content_block"]["name"].as_str(),
+            Some("Read"),
+            "placeholder tool_use must be Read"
+        );
+        assert!(
+            events.iter().all(|e| {
+                !(e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "tool_use"
+                    && e.data["content_block"]["name"] == "Write")
+            }),
+            "should not emit the original Write tool_use content_block_start"
+        );
+
+        let truncation_delta = events.iter().find(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"] == WRITE_TOOL_TRUNCATED_ERROR
+        });
+        assert!(
+            truncation_delta.is_some(),
+            "should emit a text_delta with the truncation system prompt"
+        );
+        let truncation_index = truncation_delta.unwrap().data["index"]
+            .as_i64()
+            .expect("truncation text_delta must have index");
+        assert!(
+            events.iter().any(|e| {
+                e.event == "content_block_start"
+                    && e.data["index"].as_i64() == Some(truncation_index)
+                    && e.data["content_block"]["type"] == "text"
+            }),
+            "should start a new text block for the truncation message"
+        );
+        assert!(
+            events.iter().any(|e| {
+                e.event == "content_block_stop"
+                    && e.data["index"].as_i64() == Some(truncation_index)
+            }),
+            "should stop the truncation text block"
+        );
+
+        assert!(
+            ctx.tool_block_indices.get("tool_1").is_none(),
+            "tool block index must not be allocated when Write tool validation fails"
+        );
+
+        assert_eq!(
+            ctx.state_manager.get_stop_reason(),
+            "tool_use",
+            "stop_reason must be tool_use after truncation"
+        );
+    }
+
+    #[test]
+    fn test_write_tool_stream_end_without_stop_is_replaced_with_error() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false);
+        let _initial_events = ctx.generate_initial_events();
+
+        let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: r#"{"path":"a","content":"abc""#.to_string(),
+            stop: false,
+        });
+        assert!(
+            tool_events
+                .iter()
+                .all(|e| e.data["delta"]["type"] != "input_json_delta"),
+            "Write tool input should be buffered and not streamed before stop=true"
+        );
+        assert!(
+            tool_events.iter().all(|e| {
+                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use")
+            }),
+            "Write tool must not emit tool_use content_block_start before stop=true"
+        );
+
+        let final_events = ctx.generate_final_events();
+        let input_deltas: Vec<&SseEvent> = final_events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+            })
+            .collect();
+        assert_eq!(
+            input_deltas.len(),
+            1,
+            "should emit one placeholder input_json_delta on final flush"
+        );
+        assert_eq!(
+            input_deltas[0].data["delta"]["partial_json"].as_str(),
+            Some(r#"{"file_path": "/__placeholder_to_trigger_continue__"}"#),
+            "placeholder input_json_delta should contain the placeholder Read input"
+        );
+
+        let tool_use_starts: Vec<&SseEvent> = final_events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .collect();
+        assert_eq!(
+            tool_use_starts.len(),
+            1,
+            "should emit one placeholder tool_use content_block_start on final flush"
+        );
+        assert_eq!(
+            tool_use_starts[0].data["content_block"]["name"].as_str(),
+            Some("Read"),
+            "placeholder tool_use must be Read"
+        );
+        assert!(
+            final_events.iter().all(|e| {
+                !(e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "tool_use"
+                    && e.data["content_block"]["name"] == "Write")
+            }),
+            "should not emit the original Write tool_use content_block_start on final flush"
+        );
+
+        assert!(
+            final_events.iter().any(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "text_delta"
+                    && e.data["delta"]["text"] == WRITE_TOOL_TRUNCATED_ERROR
+            }),
+            "should emit a text_delta with the truncation system prompt at stream end"
+        );
+
+        // Ensure event order: text block -> tool_use -> message_delta(tool_use) -> message_stop
+        let text_delta_pos = final_events.iter().position(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"] == WRITE_TOOL_TRUNCATED_ERROR
+        });
+        assert!(
+            text_delta_pos.is_some(),
+            "should contain truncation text_delta"
+        );
+        let text_delta_pos = text_delta_pos.unwrap();
+
+        let text_index = final_events[text_delta_pos].data["index"]
+            .as_i64()
+            .expect("truncation text_delta must have index");
+        let text_start_pos = final_events.iter().position(|e| {
+            e.event == "content_block_start"
+                && e.data["index"].as_i64() == Some(text_index)
+                && e.data["content_block"]["type"] == "text"
+        });
+        assert!(text_start_pos.is_some(), "text block should be started");
+        let text_start_pos = text_start_pos.unwrap();
+        let text_stop_pos = final_events.iter().position(|e| {
+            e.event == "content_block_stop" && e.data["index"].as_i64() == Some(text_index)
+        });
+        assert!(text_stop_pos.is_some(), "text block should be stopped");
+        let text_stop_pos = text_stop_pos.unwrap();
+        assert!(
+            text_start_pos < text_delta_pos && text_delta_pos < text_stop_pos,
+            "text block events should be start -> delta -> stop"
+        );
+
+        let tool_start_pos = final_events.iter().position(|e| {
+            e.event == "content_block_start"
+                && e.data["content_block"]["type"] == "tool_use"
+                && e.data["content_block"]["name"] == "Read"
+        });
+        assert!(
+            tool_start_pos.is_some(),
+            "should contain placeholder Read tool_use start"
+        );
+        let tool_start_pos = tool_start_pos.unwrap();
+
+        let tool_index = final_events[tool_start_pos].data["index"]
+            .as_i64()
+            .expect("tool_use start must have index");
+        let tool_delta_pos = final_events.iter().position(|e| {
+            e.event == "content_block_delta"
+                && e.data["index"].as_i64() == Some(tool_index)
+                && e.data["delta"]["type"] == "input_json_delta"
+                && e.data["delta"]["partial_json"]
+                    == r#"{"file_path": "/__placeholder_to_trigger_continue__"}"#
+        });
+        assert!(
+            tool_delta_pos.is_some(),
+            "should contain placeholder input_json_delta for Read"
+        );
+        let tool_delta_pos = tool_delta_pos.unwrap();
+
+        let tool_stop_pos = final_events.iter().position(|e| {
+            e.event == "content_block_stop" && e.data["index"].as_i64() == Some(tool_index)
+        });
+        assert!(tool_stop_pos.is_some(), "tool_use block should be stopped");
+        let tool_stop_pos = tool_stop_pos.unwrap();
+        assert!(
+            tool_start_pos < tool_delta_pos && tool_delta_pos < tool_stop_pos,
+            "tool_use block events should be start -> delta -> stop"
+        );
+
+        let message_delta_pos = final_events
+            .iter()
+            .position(|e| e.event == "message_delta")
+            .expect("should contain message_delta");
+        let message_stop_pos = final_events
+            .iter()
+            .position(|e| e.event == "message_stop")
+            .expect("should contain message_stop");
+        assert!(
+            text_stop_pos < tool_start_pos
+                && tool_stop_pos < message_delta_pos
+                && message_delta_pos < message_stop_pos,
+            "final event order should be text -> tool_use -> message_delta -> message_stop"
+        );
+
+        let message_delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should contain message_delta");
+        assert_eq!(
+            message_delta.data["delta"]["stop_reason"], "tool_use",
+            "stop_reason must be tool_use after truncation"
+        );
+    }
+
+    #[test]
+    fn test_write_tool_content_over_limit_is_replaced_with_error() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false);
+        let _initial_events = ctx.generate_initial_events();
+
+        // 12001 个中文字符约为 8001 tokens（按 estimate_tokens 的近似）
+        let content = "你".repeat(12_001);
+        let input = serde_json::to_string(&json!({
+            "path": "a",
+            "content": content
+        }))
+        .expect("should serialize input json");
+
+        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input,
+            stop: true,
+        });
+
+        let input_deltas: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+            })
+            .collect();
+        assert_eq!(
+            input_deltas.len(),
+            1,
+            "should emit one placeholder input_json_delta to trigger client continuation"
+        );
+        assert_eq!(
+            input_deltas[0].data["delta"]["partial_json"].as_str(),
+            Some(r#"{"file_path": "/__placeholder_to_trigger_continue__"}"#),
+            "placeholder input_json_delta should contain the placeholder Read input"
+        );
+
+        let tool_use_starts: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .collect();
+        assert_eq!(
+            tool_use_starts.len(),
+            1,
+            "should emit one placeholder tool_use content_block_start"
+        );
+        assert_eq!(
+            tool_use_starts[0].data["content_block"]["name"].as_str(),
+            Some("Read"),
+            "placeholder tool_use must be Read"
+        );
+        assert!(
+            events.iter().all(|e| {
+                !(e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "tool_use"
+                    && e.data["content_block"]["name"] == "Write")
+            }),
+            "should not emit the original Write tool_use content_block_start"
+        );
+
+        assert!(
+            events.iter().any(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "text_delta"
+                    && e.data["delta"]["text"] == WRITE_TOOL_TRUNCATED_ERROR
+            }),
+            "should emit a text_delta with the truncation system prompt"
+        );
+
+        assert_eq!(
+            ctx.state_manager.get_stop_reason(),
+            "tool_use",
+            "stop_reason must be tool_use after truncation"
+        );
+    }
+
+    #[test]
+    fn test_write_tool_emits_complete_tool_block_only_on_stop_after_validation() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false);
+        let _initial_events = ctx.generate_initial_events();
+
+        let chunk1 = r#"{"path":"a","content":"ab"#.to_string();
+        let chunk2 = r#"c"}"#.to_string();
+        let full_json = r#"{"path":"a","content":"abc"}"#;
+
+        let events1 = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: chunk1,
+            stop: false,
+        });
+        assert!(
+            events1.iter().all(|e| {
+                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use")
+            }),
+            "Write tool must not start tool_use block before stop=true"
+        );
+        assert!(
+            events1.iter().all(|e| {
+                !(e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta")
+            }),
+            "Write tool must not stream input_json_delta before stop=true"
+        );
+
+        let events2 = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: chunk2,
+            stop: true,
+        });
+
+        let tool_start = events2
+            .iter()
+            .find(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("should emit tool_use content_block_start on stop=true");
+        let tool_index = tool_start.data["index"]
+            .as_i64()
+            .expect("tool_use start must contain index");
+
+        let input_deltas: Vec<&SseEvent> = events2
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+            })
+            .collect();
+        assert_eq!(
+            input_deltas.len(),
+            1,
+            "should emit exactly one input_json_delta for Write tool on stop=true"
+        );
+        assert_eq!(
+            input_deltas[0].data["delta"]["partial_json"], full_json,
+            "input_json_delta must contain the complete JSON payload"
+        );
+        assert!(
+            events2.iter().any(|e| {
+                e.event == "content_block_stop" && e.data["index"].as_i64() == Some(tool_index)
+            }),
+            "should stop the tool_use block after emitting the full JSON"
+        );
+        assert_eq!(
+            ctx.tool_block_indices.get("tool_1").copied(),
+            Some(tool_index as i32),
+            "tool_block_indices should record the emitted tool_use block index"
+        );
     }
 
     #[test]
@@ -1506,7 +2220,7 @@ mod tests {
         all_events.extend(ctx.process_assistant_response("<thinking>abc</thinking>"));
 
         let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-            name: "Write".to_string(),
+            name: "test_tool".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
             stop: false,
@@ -1644,7 +2358,12 @@ mod tests {
 
         let full_thinking: String = thinking_deltas
             .iter()
-            .filter(|e| !e.data["delta"]["thinking"].as_str().unwrap_or("").is_empty())
+            .filter(|e| {
+                !e.data["delta"]["thinking"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty()
+            })
             .map(|e| e.data["delta"]["thinking"].as_str().unwrap_or(""))
             .collect();
 
@@ -1657,14 +2376,11 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
         let _initial_events = ctx.generate_initial_events();
 
-        let events =
-            ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
+        let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
 
         let text_deltas: Vec<_> = events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .collect();
 
         let full_text: String = text_deltas
@@ -1696,9 +2412,7 @@ mod tests {
     fn collect_text_content(events: &[SseEvent]) -> String {
         events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
             .collect()
     }
@@ -1717,7 +2431,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1735,7 +2453,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1755,7 +2477,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "text", "text should be 'text', got: {:?}", text);
@@ -1784,7 +2510,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "hello", "thinking should be 'hello', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "hello",
+            "thinking should be 'hello', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "world", "text should be 'world', got: {:?}", text);
@@ -1874,12 +2604,14 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
-        all_events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-            name: "test_tool".to_string(),
-            tool_use_id: "tool_1".to_string(),
-            input: "{}".to_string(),
-            stop: true,
-        }));
+        all_events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "test_tool".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events

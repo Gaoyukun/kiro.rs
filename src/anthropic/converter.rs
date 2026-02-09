@@ -14,11 +14,13 @@ use crate::kiro::model::requests::tool::{
 
 use super::types::{ContentBlock, MessagesRequest};
 
-/// 追加到 Write 工具 description 末尾的内容
-const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
+/// 追加到 Write 工具 description 末尾的长度限制提示
+const WRITE_TOOL_LENGTH_LIMIT_NOTICE: &str =
+    "铁律：单次写入不能超过7000个汉字或英文单词。如果内容超长，先用Write写入前7000字，剩余内容用Edit工具追加。";
 
-/// 追加到 Edit 工具 description 末尾的内容
-const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
+/// 追加到 Edit 工具 description 末尾的长度限制提示
+const EDIT_TOOL_LENGTH_LIMIT_NOTICE: &str =
+    "铁律：单次编辑内容不能超过7000个汉字或英文单词。如果内容超长，需要多次调用Edit分批编辑。";
 
 /// 追加到系统提示词的分块写入策略
 const SYSTEM_CHUNKED_POLICY: &str = "\
@@ -27,11 +29,53 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
+const TOOL_DESCRIPTION_MAX_CHARS: usize = 10000;
+
+fn truncate_string_to_chars(mut s: String, max_chars: usize) -> String {
+    if let Some((idx, _)) = s.char_indices().nth(max_chars) {
+        s.truncate(idx);
+    }
+    s
+}
+
+fn tool_description_with_length_limit(name: &str, base_description: &str) -> String {
+    let limit_notice = if name.eq_ignore_ascii_case("write") {
+        Some(WRITE_TOOL_LENGTH_LIMIT_NOTICE)
+    } else if name.eq_ignore_ascii_case("edit") {
+        Some(EDIT_TOOL_LENGTH_LIMIT_NOTICE)
+    } else {
+        None
+    };
+
+    let Some(limit_notice) = limit_notice else {
+        return truncate_string_to_chars(base_description.to_string(), TOOL_DESCRIPTION_MAX_CHARS);
+    };
+
+    if base_description.is_empty() {
+        return truncate_string_to_chars(limit_notice.to_string(), TOOL_DESCRIPTION_MAX_CHARS);
+    }
+
+    let notice_chars = limit_notice.chars().count();
+    let separator_chars = 1usize;
+    if notice_chars + separator_chars >= TOOL_DESCRIPTION_MAX_CHARS {
+        return truncate_string_to_chars(limit_notice.to_string(), TOOL_DESCRIPTION_MAX_CHARS);
+    }
+
+    let base_max_chars = TOOL_DESCRIPTION_MAX_CHARS - notice_chars - separator_chars;
+    let mut description = truncate_string_to_chars(base_description.to_string(), base_max_chars);
+    if !description.is_empty() {
+        description.push('\n');
+    }
+    description.push_str(limit_notice);
+    description
+}
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
 /// - 所有 sonnet → claude-sonnet-4.5
-/// - 所有 opus → claude-opus-4.5
+/// - opus + 4.5 → claude-opus-4.5
+/// - opus + 4.6 → claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
@@ -122,7 +166,10 @@ fn create_placeholder_tool(name: &str) -> Tool {
     Tool {
         tool_specification: ToolSpecification {
             name: name.to_string(),
-            description: "Tool used in conversation history".to_string(),
+            description: tool_description_with_length_limit(
+                name,
+                "Tool used in conversation history",
+            ),
             input_schema: InputSchema::from_json(serde_json::json!({
                 "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "object",
@@ -448,24 +495,7 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
     tools
         .iter()
         .map(|t| {
-            let mut description = t.description.clone();
-
-            // 对 Write/Edit 工具追加自定义描述后缀
-            let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                _ => "",
-            };
-            if !suffix.is_empty() {
-                description.push('\n');
-                description.push_str(suffix);
-            }
-
-            // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-            let description = match description.char_indices().nth(10000) {
-                Some((idx, _)) => description[..idx].to_string(),
-                None => description,
-            };
+            let description = tool_description_with_length_limit(&t.name, &t.description);
 
             Tool {
                 tool_specification: ToolSpecification {
@@ -835,6 +865,72 @@ mod tests {
         // 验证 JSON 序列化正确
         let json = serde_json::to_string(&tool).unwrap();
         assert!(json.contains("\"name\":\"my_custom_tool\""));
+    }
+
+    #[test]
+    fn test_convert_tools_injects_write_limit_notice() {
+        use super::super::types::Tool as AnthropicTool;
+
+        let tools = Some(vec![AnthropicTool {
+            tool_type: None,
+            name: "Write".to_string(),
+            description: "Write a file".to_string(),
+            input_schema: std::collections::HashMap::new(),
+            max_uses: None,
+        }]);
+
+        let converted = convert_tools(&tools);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(
+            converted[0].tool_specification.description,
+            format!("Write a file\n{}", WRITE_TOOL_LENGTH_LIMIT_NOTICE)
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_injects_edit_limit_notice_when_description_empty() {
+        use super::super::types::Tool as AnthropicTool;
+
+        let tools = Some(vec![AnthropicTool {
+            tool_type: None,
+            name: "edit".to_string(),
+            description: String::new(),
+            input_schema: std::collections::HashMap::new(),
+            max_uses: None,
+        }]);
+
+        let converted = convert_tools(&tools);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(
+            converted[0].tool_specification.description,
+            EDIT_TOOL_LENGTH_LIMIT_NOTICE
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_truncates_but_preserves_write_limit_notice() {
+        use super::super::types::Tool as AnthropicTool;
+
+        let long_desc = "a".repeat(TOOL_DESCRIPTION_MAX_CHARS);
+        let tools = Some(vec![AnthropicTool {
+            tool_type: None,
+            name: "write".to_string(),
+            description: long_desc,
+            input_schema: std::collections::HashMap::new(),
+            max_uses: None,
+        }]);
+
+        let converted = convert_tools(&tools);
+        assert_eq!(converted.len(), 1);
+
+        let desc = &converted[0].tool_specification.description;
+        assert!(desc.ends_with(WRITE_TOOL_LENGTH_LIMIT_NOTICE));
+        assert!(
+            desc.chars().count() <= TOOL_DESCRIPTION_MAX_CHARS,
+            "description should be truncated to <= {} chars",
+            TOOL_DESCRIPTION_MAX_CHARS
+        );
+        assert!(desc.contains(&format!("\n{}", WRITE_TOOL_LENGTH_LIMIT_NOTICE)));
     }
 
     #[test]
